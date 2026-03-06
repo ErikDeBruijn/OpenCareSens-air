@@ -128,9 +128,9 @@ check_boundary         @ 0x6d3d8  (fully decompiled by Ghidra)
 **Error detection:**
 ```
 check_error            @ 0x66688  (8008 instructions — ALL err1–err128 in one function)
-cal_threshold          @ 0x61518  (fully decompiled by Ghidra)
-err1_TD_var_update     @ 0x6160c  (fully decompiled by Ghidra)
-err1_TD_trio_update    @ 0x61658  (fully decompiled by Ghidra)
+cal_threshold          @ 0x61518 and 0x6e908  (TWO copies in opcal4 region, both fully decompiled)
+err1_TD_var_update     @ 0x6160c and 0x6e9fc  (TWO copies in opcal4 region)
+err1_TD_trio_update    @ 0x61658 and 0x6ea48  (TWO copies in opcal4 region)
 f_check_cgm_trend      @ 0x6e498  (fully decompiled by Ghidra)
 f_cgm_trend            @ 0x6d950  (636 instructions, full disasm)
 ```
