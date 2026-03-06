@@ -1,0 +1,25 @@
+# Proprietary assets (reproducible via scripts/)
+vendor/apk/
+vendor/native/
+vendor/decompiled_java/
+
+# Generated analysis files (reproducible via scripts/)
+vendor/decompiled_c/
+vendor/disasm/
+vendor/ghidra_project/
+
+# Build artifacts
+build/
+*.o
+*.so
+*.a
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
