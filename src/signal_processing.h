@@ -113,4 +113,47 @@ void f_cgm_trend(struct air1_opcal4_arguments_t *args,
                  uint32_t trend_pass,
                  uint16_t cal_trendRate);
 
+/*
+ * smooth1q_err16: Hann window + Fourier decomposition smoothing.
+ *
+ * From ARM disasm @ 0x6d740 (opcal4, 162 instructions).
+ *
+ * Used by the err16 (sensor drift/degradation) error detector
+ * to smooth ISF data. Called exactly 2 times from check_error.
+ *
+ * Parameters:
+ *   input:  Pointer to input array of n doubles.
+ *   n:      Number of data points (must be > 0).
+ *   output: Pointer to output array of n doubles.
+ *
+ * Algorithm:
+ *   1. Compute Hann window coefficients:
+ *      w[i] = 2.0 - 2.0 * cos(2*i * pi / n)  for i = 0..n-1
+ *
+ *   2. Fourier analysis: compute DFT coefficients with Hann damping
+ *      For each frequency m = 0..n-1:
+ *        a[m] = sum_j(input[j] * cos(2*pi*m*j / n))
+ *        b[m] = sum_j(input[j] * sin(2*pi*m*j / n))
+ *        scale = 1.0 / (1.0 + n * w[m]^2)
+ *        a_s[m] = a[m] * scale
+ *        b_s[m] = b[m] * scale
+ *
+ *   3. Fourier synthesis: reconstruct smoothed signal
+ *      For each output position i = 0..n-1:
+ *        output[i] = sum_m[ (a_s[m]*cos(2*pi*i*m/n)
+ *                          + b_s[m]*sin(2*pi*i*m/n)) / n ]
+ *
+ * Constants from literal pool:
+ *   pi (0x6d928), -2*pi (0x6d930), -0.0 (0x6d938), 2*pi (0x6d940)
+ *   d10 = 2.0, d11 = 1.0
+ *
+ * Stack usage: ~0x4e8 bytes (Hann coefficients at sp+0x350,
+ *              Fourier coefficient pairs at sp+0x30).
+ *
+ * Maximum n: 50 (limited by stack array sizes:
+ *            sp+0x350 holds 50 doubles for Hann coefficients,
+ *            sp+0x30 holds 50 pairs = 100 doubles).
+ */
+void smooth1q_err16(double *input, uint32_t n, double *output);
+
 #endif /* SIGNAL_PROCESSING_H */

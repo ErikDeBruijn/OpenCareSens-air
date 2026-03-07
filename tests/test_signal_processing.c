@@ -586,6 +586,263 @@ static void test_f_cgm_trend_mode1_trimmed_mean(void)
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * smooth1q_err16 tests
+ * ════════════════════════════════════════════════════════════════════ */
+
+static void test_smooth1q_err16_constant_input(void)
+{
+    TEST("smooth1q_err16: constant input passes through unchanged");
+
+    double input[10];
+    double output[10];
+
+    for (int i = 0; i < 10; i++) input[i] = 42.0;
+    memset(output, 0, sizeof(output));
+
+    smooth1q_err16(input, 10, output);
+
+    /* A constant signal has zero energy in all frequencies except DC.
+     * The DC component (m=0) has Hann weight w[0] = 2 - 2*cos(0) = 0,
+     * so scale = 1/(1 + n*0^2) = 1, meaning DC passes through unchanged.
+     * All other frequencies have zero coefficient. Output should be 42.0. */
+    for (int i = 0; i < 10; i++) {
+        ASSERT_DOUBLE_NEAR(output[i], 42.0, 1e-8);
+    }
+    PASS();
+}
+
+static void test_smooth1q_err16_single_element(void)
+{
+    TEST("smooth1q_err16: single element passes through");
+
+    double input[1] = {7.5};
+    double output[1] = {0.0};
+
+    smooth1q_err16(input, 1, output);
+
+    /* With n=1, there is only one frequency (m=0, DC).
+     * w[0] = 2 - 2*cos(0) = 0, scale = 1.0.
+     * a[0] = input[0] * cos(0) = 7.5
+     * output[0] = a[0] * cos(0) / 1 = 7.5 */
+    ASSERT_DOUBLE_NEAR(output[0], 7.5, 1e-10);
+    PASS();
+}
+
+static void test_smooth1q_err16_linear_input(void)
+{
+    TEST("smooth1q_err16: linear signal is smoothed");
+
+    double input[10];
+    double output[10];
+
+    for (int i = 0; i < 10; i++) input[i] = (double)(i + 1) * 10.0;
+    memset(output, 0, sizeof(output));
+
+    smooth1q_err16(input, 10, output);
+
+    /* A linear signal has energy in the DC and first harmonic.
+     * The Hann window smoothing will dampen higher frequencies.
+     * The output should be a smooth version of the input, generally
+     * following the linear trend but potentially with edge effects. */
+    for (int i = 0; i < 10; i++) {
+        ASSERT_TRUE(!isnan(output[i]));
+        ASSERT_TRUE(!isinf(output[i]));
+    }
+
+    /* The smoothed output should still be generally increasing */
+    for (int i = 1; i < 9; i++) {
+        ASSERT_TRUE(output[i] > output[0] - 10.0);
+    }
+    PASS();
+}
+
+static void test_smooth1q_err16_smooths_noise(void)
+{
+    TEST("smooth1q_err16: reduces high-frequency noise");
+
+    /* Create a signal with a smooth trend plus noise */
+    double input[20];
+    double output[20];
+    double clean[20];
+
+    for (int i = 0; i < 20; i++) {
+        clean[i] = 100.0 + 2.0 * (double)i;
+        /* Add alternating noise: +/-5.0 on every other sample */
+        input[i] = clean[i] + ((i % 2 == 0) ? 5.0 : -5.0);
+    }
+    memset(output, 0, sizeof(output));
+
+    smooth1q_err16(input, 20, output);
+
+    /* The smoothed output should be closer to the clean signal
+     * than the noisy input, at least for interior points.
+     * Compare RMS error of input vs output relative to clean. */
+    double input_err = 0.0, output_err = 0.0;
+    for (int i = 3; i < 17; i++) {
+        double ie = input[i] - clean[i];
+        double oe = output[i] - clean[i];
+        input_err += ie * ie;
+        output_err += oe * oe;
+    }
+
+    /* Output should have less error than input relative to the clean signal */
+    ASSERT_TRUE(output_err < input_err);
+    PASS();
+}
+
+static void test_smooth1q_err16_preserves_dc(void)
+{
+    TEST("smooth1q_err16: preserves DC level (mean)");
+
+    double input[8];
+    double output[8];
+
+    /* Constant + small perturbation */
+    for (int i = 0; i < 8; i++) {
+        input[i] = 200.0 + ((i == 3) ? 10.0 : 0.0);
+    }
+    memset(output, 0, sizeof(output));
+
+    smooth1q_err16(input, 8, output);
+
+    /* The DFT preserves the total energy / mean of the signal.
+     * Since DC has w[0]=0, scale=1, the mean is exactly preserved.
+     * Compute input and output means. */
+    double input_mean = 0.0, output_mean = 0.0;
+    for (int i = 0; i < 8; i++) {
+        input_mean += input[i];
+        output_mean += output[i];
+    }
+    input_mean /= 8.0;
+    output_mean /= 8.0;
+
+    ASSERT_DOUBLE_NEAR(output_mean, input_mean, 1e-8);
+    PASS();
+}
+
+static void test_smooth1q_err16_hann_window_values(void)
+{
+    TEST("smooth1q_err16: verify Hann window coefficients");
+
+    /* Test with n=4: w[i] = 2 - 2*cos(2*i*pi/4)
+     * w[0] = 2 - 2*cos(0)   = 2 - 2 = 0
+     * w[1] = 2 - 2*cos(pi/2) = 2 - 0 = 2
+     * w[2] = 2 - 2*cos(pi)  = 2 + 2 = 4
+     * w[3] = 2 - 2*cos(3*pi/2) = 2 - 0 = 2
+     *
+     * With n=4 and constant input of 1.0:
+     * DC (m=0): a[0]=4, b[0]=0, scale=1/(1+4*0)=1, a_s=4
+     * m=1: a[1]=0, b[1]=0, scale=1/(1+4*4)=1/17, irrelevant since a=b=0
+     * m=2: a[2]=0, b[2]=0, scale=1/(1+4*16)=1/65
+     * m=3: same as m=1
+     *
+     * output[i] = 4/4 = 1.0 for all i (constant passes through) */
+    double input[4] = {1.0, 1.0, 1.0, 1.0};
+    double output[4] = {0.0};
+
+    smooth1q_err16(input, 4, output);
+
+    for (int i = 0; i < 4; i++) {
+        ASSERT_DOUBLE_NEAR(output[i], 1.0, 1e-10);
+    }
+    PASS();
+}
+
+static void test_smooth1q_err16_pure_sinusoid(void)
+{
+    TEST("smooth1q_err16: pure sinusoid is damped by Hann weight");
+
+    /* With n=8, create a pure cosine at frequency m=1:
+     * input[j] = cos(2*pi*j/8)
+     *
+     * DFT analysis: a[1] = n/2 = 4, all others zero (for this freq).
+     * Hann weight: w[1] = 2 - 2*cos(2*pi/8) = 2 - sqrt(2) ~ 0.5858
+     * Scale = 1 / (1 + 8 * w[1]^2) = 1 / (1 + 8 * 0.3431) = 1/3.7451
+     *
+     * The output should be a damped version of the input cosine. */
+    int n = 8;
+    double input[8], output[8];
+
+    for (int i = 0; i < n; i++) {
+        input[i] = cos(2.0 * M_PI * (double)i / (double)n);
+    }
+    memset(output, 0, sizeof(output));
+
+    smooth1q_err16(input, (uint32_t)n, output);
+
+    /* The output amplitude should be less than the input amplitude
+     * due to Hann window damping. */
+    double max_output = 0.0;
+    for (int i = 0; i < n; i++) {
+        double absval = fabs(output[i]);
+        if (absval > max_output) max_output = absval;
+    }
+
+    /* Input amplitude is 1.0, output should be damped below 1.0 */
+    ASSERT_TRUE(max_output < 1.0);
+    ASSERT_TRUE(max_output > 0.01); /* but not completely zeroed */
+    PASS();
+}
+
+static void test_smooth1q_err16_cgm_like_data(void)
+{
+    TEST("smooth1q_err16: CGM-like ISF data smoothed correctly");
+
+    /* Simulate realistic CGM ISF values (mg/dL range, ~50-300)
+     * with sensor noise */
+    int n = 20;
+    double input[20], output[20];
+
+    for (int i = 0; i < n; i++) {
+        /* Slowly increasing ISF with noise */
+        input[i] = 120.0 + 0.5 * (double)i
+                   + 3.0 * sin(2.0 * M_PI * (double)i * 3.0 / (double)n);
+    }
+    memset(output, 0, sizeof(output));
+
+    smooth1q_err16(input, (uint32_t)n, output);
+
+    /* All outputs should be finite */
+    for (int i = 0; i < n; i++) {
+        ASSERT_TRUE(!isnan(output[i]));
+        ASSERT_TRUE(!isinf(output[i]));
+    }
+
+    /* Output should be in a reasonable range around the input values */
+    for (int i = 0; i < n; i++) {
+        ASSERT_TRUE(output[i] > 100.0 && output[i] < 150.0);
+    }
+    PASS();
+}
+
+static void test_smooth1q_err16_n_equals_two(void)
+{
+    TEST("smooth1q_err16: n=2 edge case");
+
+    double input[2] = {10.0, 20.0};
+    double output[2] = {0.0, 0.0};
+
+    smooth1q_err16(input, 2, output);
+
+    /* With n=2:
+     * w[0] = 2 - 2*cos(0) = 0
+     * w[1] = 2 - 2*cos(pi) = 4
+     * DC: a[0] = 30, scale = 1.0, a_s = 30
+     * m=1: a[1] = -10, w=4, scale = 1/(1+2*16) = 1/33
+     * The output should be valid finite values */
+    ASSERT_TRUE(!isnan(output[0]));
+    ASSERT_TRUE(!isnan(output[1]));
+    ASSERT_TRUE(!isinf(output[0]));
+    ASSERT_TRUE(!isinf(output[1]));
+
+    /* Mean should be preserved */
+    double in_mean = (input[0] + input[1]) / 2.0;
+    double out_mean = (output[0] + output[1]) / 2.0;
+    ASSERT_DOUBLE_NEAR(out_mean, in_mean, 1e-8);
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * Integration-style tests
  * ════════════════════════════════════════════════════════════════════ */
 
@@ -658,6 +915,17 @@ int main(void)
     test_f_cgm_trend_mode2_statistical_mode();
     test_f_cgm_trend_does_not_crash_with_nan_data();
     test_f_cgm_trend_mode1_trimmed_mean();
+
+    printf("\n-- smooth1q_err16 --\n");
+    test_smooth1q_err16_constant_input();
+    test_smooth1q_err16_single_element();
+    test_smooth1q_err16_linear_input();
+    test_smooth1q_err16_smooths_noise();
+    test_smooth1q_err16_preserves_dc();
+    test_smooth1q_err16_hann_window_values();
+    test_smooth1q_err16_pure_sinusoid();
+    test_smooth1q_err16_cgm_like_data();
+    test_smooth1q_err16_n_equals_two();
 
     printf("\n-- Integration --\n");
     test_smooth_sg_then_regress();

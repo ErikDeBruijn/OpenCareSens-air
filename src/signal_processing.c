@@ -907,3 +907,217 @@ void f_cgm_trend(struct air1_opcal4_arguments_t *args,
         (void)max_val2;
     }
 }
+
+/* ────────────────────────────────────────────────────────────────────
+ * smooth1q_err16: Hann window + Fourier decomposition smoothing
+ *
+ * From ARM disasm @ 0x6d740 (opcal4, 162 instructions).
+ *
+ * This function implements a frequency-domain smoothing filter used
+ * by the err16 (sensor drift/degradation) error detector. The filter
+ * works by computing the DFT, applying frequency-dependent damping
+ * via the Hann window, and synthesizing the result via inverse DFT.
+ *
+ * Register mapping from disassembly:
+ *   r10 = input array pointer (r0 on entry)
+ *   r11 = n (r1 on entry)
+ *   sp+0x4 = output array pointer (r2 on entry)
+ *   d8  = (double)n
+ *   d9  = pi (phase 1), then 0.0 (phase 2), then 2*pi (phase 3)
+ *   d10 = 2.0 (phase 1), then m * (-2*pi) (phase 2)
+ *   d11 = 1.0
+ *   d12 = -0.0 (used as initial value in multiply-accumulate patterns)
+ *   sp+0x350 = Hann window coefficients (n doubles)
+ *   sp+0x30  = Fourier coefficient pairs (n x 2 doubles)
+ * ──────────────────────────────────────────────────────────────────── */
+
+/* Maximum number of data points for smooth1q_err16.
+ * From stack layout: sp+0x350 holds up to 50 doubles for Hann coefficients
+ * (0x350 - 0x30 = 0x320 = 800 bytes = 100 doubles = 50 pairs). */
+#define SMOOTH1Q_MAX_N 50
+
+void smooth1q_err16(double *input, uint32_t n, double *output)
+{
+    double hann[SMOOTH1Q_MAX_N];          /* sp+0x350: Hann window coefficients */
+    double coef[SMOOTH1Q_MAX_N][2];       /* sp+0x30:  Fourier coefficient pairs
+                                           * [m][0] = a_scaled, [m][1] = -b_scaled */
+    uint32_t actual_n = n;
+    if (actual_n > SMOOTH1Q_MAX_N)
+        actual_n = SMOOTH1Q_MAX_N;
+    if (actual_n == 0)
+        return;
+
+    double dn = (double)actual_n;         /* d8 in disasm */
+
+    /* ── Phase 1: Compute Hann window coefficients ──
+     * (disasm at 0x6d766-0x6d7b2)
+     *
+     * First, memset the Hann array (blx to memset at 0x6d76a).
+     * Then loop: for k = 0, 2, 4, ..., 2*n-2 (r5 increments by 2):
+     *   angle = k * pi / n
+     *   cos_val = cos(angle)
+     *   w[k/2] = 2.0 - 2.0 * cos_val
+     *
+     * This is the Hann window: w[i] = 2 - 2*cos(2*i*pi / n).
+     *
+     * ARM register state:
+     *   d9 = pi, d10 = 2.0, d8 = (double)n
+     *   r4 = 2*n, r5 = loop counter (0, 2, 4, ...) */
+    memset(hann, 0, sizeof(hann));
+    for (uint32_t k = 0; k < 2 * actual_n; k += 2) {
+        double angle = (double)k * M_PI / dn;
+        double cos_val = cos(angle);
+        /* disasm: d16 = d16 + d16 (double the cos), then d16 = 2.0 - d16 */
+        hann[k / 2] = 2.0 - 2.0 * cos_val;
+    }
+
+    /* ── Phase 2: Fourier analysis ──
+     * (disasm at 0x6d7b4-0x6d882)
+     *
+     * First, memset the coefficient array to zero (0x320 bytes at sp+0x30).
+     *
+     * For each frequency m = 0 to n-1 (r8):
+     *   d14 = 0 (accumulates -b[m]: sum of input[j] * sin)
+     *   d15 = 0 (accumulates a[m]: sum of input[j] * cos)
+     *   d10 = m * (-2*pi)  (base angle factor)
+     *   d13 = 0 (j counter as double, increments by 1.0)
+     *
+     *   For each data point j = 0 to n-1 (r9):
+     *     angle = m * (-2*pi) * j / n
+     *     sincos(angle, &sin_val, &cos_val)
+     *     [sp+0x20] = cos_val, [sp+0x28] = sin_val
+     *
+     *     d17 = cos_val * 0.0 (clearing via d9=0.0)
+     *     d17 += input[j] * sin_val  (vmla)
+     *     d14 += d17                 (-b[m] accumulator)
+     *
+     *     d17 = sin_val * (-0.0) (clearing via d12=-0.0)
+     *     d17 += input[j] * cos_val  (vmla)
+     *     d15 += d17                 (a[m] accumulator)
+     *
+     *   After inner loop, compute Hann-weighted scale:
+     *     w = hann[m]
+     *     d17 = w * n
+     *     d18 = 1.0 + (w * n) * w = 1 + n * w^2
+     *     scale = 1.0 / d18
+     *
+     *   Store scaled coefficients:
+     *     d17 = 0 + scale * d14     → scale * (-b[m])
+     *     d18 = (-0.0) + scale * d15 → scale * a[m]
+     *     coef[m][1] = d17  (stored at sp+0x30 + m*16 + 8)
+     *     coef[m][0] = d18  (stored at sp+0x30 + m*16 + 0)
+     */
+    memset(coef, 0, sizeof(coef));
+
+    for (uint32_t m = 0; m < actual_n; m++) {
+        double sum_a = 0.0;   /* d15: a[m] = sum(input[j] * cos(angle)) */
+        double sum_neg_b = 0.0; /* d14: -b[m] = sum(input[j] * sin(angle_neg)) */
+
+        double base_angle = (double)m * (-2.0 * M_PI); /* d10 = m * (-2*pi) */
+
+        for (uint32_t j = 0; j < actual_n; j++) {
+            double angle = base_angle * (double)j / dn;
+            double sin_val, cos_val;
+#ifdef _GNU_SOURCE
+            sincos(angle, &sin_val, &cos_val);
+#else
+            sin_val = sin(angle);
+            cos_val = cos(angle);
+#endif
+            /* The ARM binary accumulates:
+             *   d14 += input[j] * sin(angle)  where angle uses -2*pi
+             *   d15 += input[j] * cos(angle)
+             *
+             * Since cos(-x) = cos(x) and sin(-x) = -sin(x):
+             *   cos(m * (-2*pi) * j / n) = cos(2*pi*m*j/n)
+             *   sin(m * (-2*pi) * j / n) = -sin(2*pi*m*j/n)
+             *
+             * So d14 = -sum(input[j] * sin(2*pi*m*j/n)) = -b[m]
+             *    d15 = sum(input[j] * cos(2*pi*m*j/n))  = a[m]
+             */
+            sum_neg_b += input[j] * sin_val;  /* d14 += input[j] * sin */
+            sum_a += input[j] * cos_val;      /* d15 += input[j] * cos */
+        }
+
+        /* Compute Hann-weighted scale factor:
+         * d17 = w * n
+         * d18 = 1.0 + d17 * w = 1 + n * w^2
+         * scale = 1.0 / d18 */
+        double w = hann[m];
+        double denom = 1.0 + dn * w * w;
+        double scale = 1.0 / denom;
+
+        /* Store scaled coefficients:
+         * coef[m][0] = scale * a[m]     (vstr d18 at [r0])
+         * coef[m][1] = scale * (-b[m])  (vstr d17 at [r0, #8])
+         *
+         * In the disasm:
+         *   d17 = d15 * d9  (= a[m] * 0.0 = 0.0, clearing)
+         *   d18 = d14 * d12 (= (-b[m]) * (-0.0), clearing)
+         *   vmla d17, d16, d14  → d17 = 0 + scale * (-b[m])
+         *   vmla d18, d16, d15  → d18 = 0 + scale * a[m]
+         */
+        coef[m][0] = scale * sum_a;      /* a_scaled[m] */
+        coef[m][1] = scale * sum_neg_b;  /* -b_scaled[m] = scale * (-b[m]) */
+    }
+
+    /* ── Phase 3: Fourier synthesis ──
+     * (disasm at 0x6d884-0x6d900)
+     *
+     * d9 = 2*pi (loaded from literal pool at 0x6d940)
+     * r10 = sp+0x18 (sin output for sincos)
+     * r9 = sp+0x10 (cos output for sincos)
+     *
+     * For each output position i = 0 to n-1 (r5):
+     *   d10 = 0.0 (output accumulator)
+     *   r4 = 0 (angle counter: tracks i*m via repeated addition of i)
+     *   r6 = sp+0x38 (pointer to coefficient pairs, starting at +8 offset
+     *                  because the inner loop uses vldr [r6, #-8])
+     *
+     *   For each frequency m = 0 to n-1 (r11 counts down):
+     *     angle = 2*pi * (i*m) / n  (r4 = i*m, accumulated via r4 += r5)
+     *     sincos(angle, &sin_val, &cos_val)
+     *
+     *     d16 = coef[m][0] (a_scaled[m], loaded from [r6, #-8])
+     *     d17 = coef[m][1] (-b_scaled[m], loaded from [r6])
+     *     r4 += i  (for next iteration)
+     *     r6 += 16 (advance pointer)
+     *
+     *     d16 = a_scaled[m] * cos_val
+     *     vmls d16, sin_val, (-b_scaled[m])
+     *       → d16 = a_scaled[m]*cos - sin*(-b_scaled[m])
+     *       → d16 = a_scaled[m]*cos + b_scaled[m]*sin
+     *     d16 /= n
+     *     d10 += d16
+     *
+     *   output[i] = d10
+     */
+    for (uint32_t i = 0; i < actual_n; i++) {
+        double accum = 0.0;   /* d10 */
+        uint32_t angle_idx = 0; /* r4: tracks i*m via repeated addition */
+
+        for (uint32_t m = 0; m < actual_n; m++) {
+            double angle = 2.0 * M_PI * (double)angle_idx / dn;
+            double sin_val, cos_val;
+#ifdef _GNU_SOURCE
+            sincos(angle, &sin_val, &cos_val);
+#else
+            sin_val = sin(angle);
+            cos_val = cos(angle);
+#endif
+            double a_s = coef[m][0];   /* a_scaled[m] */
+            double neg_b_s = coef[m][1]; /* -b_scaled[m] */
+
+            /* disasm: d16 = a_s * cos
+             *         vmls d16, sin, neg_b_s → d16 = a_s*cos - sin*(-b_s)
+             *                                     = a_s*cos + b_s*sin
+             *         d16 /= n */
+            double val = a_s * cos_val - sin_val * neg_b_s;
+            val /= dn;
+            accum += val;
+
+            angle_idx += i; /* r4 += r5 (this makes angle_idx = i*(m+1)) */
+        }
+        output[i] = accum;
+    }
+}
