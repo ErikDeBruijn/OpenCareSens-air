@@ -14,6 +14,7 @@
 #include "check_error.h"
 #include "calibration.h"
 #include "math_utils.h"
+#include "signal_processing.h"
 
 #include <math.h>
 #include <string.h>
@@ -560,9 +561,825 @@ static void check_err16(
     uint16_t seq_current,
     double glucose_value)
 {
-    /* TODO: Implement err16 detector (sensor drift/degradation) */
-    (void)args; (void)dev_info; (void)debug;
-    (void)seq_current; (void)glucose_value;
+    (void)glucose_value;
+
+    /*
+     * Binary ref: check_error.asm lines ~373-3870
+     * Address range: 0x66ad4-0x68af0
+     *
+     * err16 is the sensor drift/degradation detector. It monitors ISF
+     * (interstitial fluid) trend statistics over the 15-day sensor
+     * lifespan. Only activates after 280 readings (~23h of data).
+     *
+     * The algorithm has these major phases:
+     *   Phase 0: Initialize all err16 state (seq == 1)
+     *   Phase 1: Entry gate (seq >= 280)
+     *   Phase 2: History shifting + ISF smoothing
+     *   Phase 3: Trend computation (f_cgm_trend x3 for min/mode/mean)
+     *   Phase 4: Trend validation (f_check_cgm_trend x3)
+     *   Phase 5: Final decision — any err16_condi[] == 1 => error_code16 = 1
+     */
+
+    uint16_t seq_val = seq_current;  /* from args->idx in binary */
+
+    /* ── Phase 0: First-time initialization (seq == 1) ──
+     *
+     * Binary ref: lines 374-560 (0x66ad8-0x66cce)
+     * When the sequence number is 1, initialize all err16 state arrays
+     * to zero/NaN. This sets up clean state for the first sensor session.
+     */
+    if (seq_val == 1) {
+        /* Clear err16_cal_cons_* arrays (50 elements each) */
+        args->err16_cal_cons_is_first = 1;
+        memset(args->err16_cal_cons_seq, 0, sizeof(args->err16_cal_cons_seq));
+        memset(args->err16_cal_cons_time, 0, sizeof(args->err16_cal_cons_time));
+        memset(args->err16_cal_cons_bgm, 0, sizeof(args->err16_cal_cons_bgm));
+        for (int i = 0; i < 50; i++) {
+            args->err16_cal_cons_bgm[i] = NAN;
+            args->err16_cal_cons_d_usercal_before[i] = NAN;
+            args->err16_cal_cons_d_usercal_after[i] = NAN;
+        }
+
+        /* Clear err16_cal_day_* arrays (30 elements each) */
+        args->err16_cal_day_i = 0;
+        args->err16_cal_day_is_first = 0;
+        memset(args->err16_cal_day_idx_ref, 0,
+               sizeof(args->err16_cal_day_idx_ref));
+        for (int i = 0; i < 30; i++) {
+            args->err16_cal_day_d_value[i] = NAN;
+            args->err16_cal_day_n_value[i] = 0;
+        }
+
+        /* Clear err16_condi[7] */
+        memset(debug->err16_condi, 0, sizeof(debug->err16_condi));
+
+        /* Clear ISF smooth history (865 doubles) */
+        for (int i = 0; i < 865; i++) {
+            args->err16_CGM_ISF_smooth[i] = NAN;
+        }
+
+        /* Clear plasma array (36 doubles) */
+        for (int i = 0; i < 36; i++) {
+            args->err16_CGM_plasma[i] = NAN;
+        }
+
+        /* Clear ISF ROC arrays */
+        args->err16_CGM_ISF_roc_n = 0.0;
+        for (int i = 0; i < 577; i++)
+            args->err16_CGM_ISF_roc_value[i] = NAN;
+        for (int i = 0; i < 36; i++) {
+            args->err16_CGM_ISF_roc_steady[i] = NAN;
+            args->err16_CGM_ISF_roc_diff[i] = NAN;
+            args->err16_CGM_ISF_roc_ratio[i] = NAN;
+        }
+        args->err16_CGM_ISF_roc_min = 0.0;
+        for (int i = 0; i < 865; i++)
+            args->err16_CGM_ISF_roc_min_temp[i] = NAN;
+        args->err16_CGM_ISF_roc_min_prev = 0.0;
+
+        /* Clear trend_min arrays */
+        args->err16_CGM_ISF_trend_min_n = 0.0;
+        args->err16_CGM_ISF_trend_min_value = NAN;
+        args->err16_CGM_ISF_trend_min_value_prev = 0.0;
+        for (int i = 0; i < 865; i++)
+            args->err16_CGM_ISF_trend_min_value_arr[i] = NAN;
+        for (int i = 0; i < 36; i++) {
+            args->err16_CGM_ISF_trend_min_slope1[i] = NAN;
+            args->err16_CGM_ISF_trend_min_slope2[i] = NAN;
+            args->err16_CGM_ISF_trend_min_rsq1[i] = NAN;
+            args->err16_CGM_ISF_trend_min_rsq2[i] = NAN;
+            args->err16_CGM_ISF_trend_min_diff[i] = NAN;
+            args->err16_CGM_ISF_trend_min_ratio[i] = NAN;
+        }
+        args->err16_CGM_ISF_trend_min_max = 0.0;
+        for (int i = 0; i < 865; i++)
+            args->err16_CGM_ISF_trend_min_max_temp[i] = NAN;
+        args->err16_CGM_ISF_trend_min_max_prev = 0.0;
+        args->err16_CGM_ISF_trend_min_max_early = 0.0;
+
+        /* Clear trend_mode arrays */
+        args->err16_CGM_ISF_trend_mode_n = 0.0;
+        args->err16_CGM_ISF_trend_mode_value = NAN;
+        args->err16_CGM_ISF_trend_mode_value_prev = 0.0;
+        for (int i = 0; i < 36; i++) {
+            args->err16_CGM_ISF_trend_mode_proportion[i] = NAN;
+            args->err16_CGM_ISF_trend_mode_diff[i] = NAN;
+            args->err16_CGM_ISF_trend_mode_ratio[i] = NAN;
+        }
+        args->err16_CGM_ISF_trend_mode_max = 0.0;
+        for (int i = 0; i < 865; i++)
+            args->err16_CGM_ISF_trend_mode_max_temp[i] = NAN;
+        args->err16_CGM_ISF_trend_mode_max_prev = 0.0;
+        args->err16_CGM_ISF_trend_mode_max_early = 0.0;
+
+        /* Clear trend_mean arrays */
+        args->err16_CGM_ISF_trend_mean_is_first = 0;
+        args->err16_CGM_ISF_trend_mean_n = 0.0;
+        args->err16_CGM_ISF_trend_mean_value = NAN;
+        args->err16_CGM_ISF_trend_mean_value_prev = 0.0;
+        for (int i = 0; i < 865; i++)
+            args->err16_CGM_ISF_trend_mean_value_arr[i] = NAN;
+        for (int i = 0; i < 36; i++) {
+            args->err16_CGM_ISF_trend_mean_slope[i] = NAN;
+            args->err16_CGM_ISF_trend_mean_rsq[i] = NAN;
+            args->err16_CGM_ISF_trend_mean_diff[i] = NAN;
+            args->err16_CGM_ISF_trend_mean_ratio[i] = NAN;
+        }
+        args->err16_CGM_ISF_trend_mean_max = 0.0;
+        for (int i = 0; i < 865; i++)
+            args->err16_CGM_ISF_trend_mean_max_temp[i] = NAN;
+        args->err16_CGM_ISF_trend_mean_max_prev = 0.0;
+        args->err16_CGM_ISF_trend_mean_max_early = 0.0;
+        args->err16_CGM_ISF_trend_mean_max_early_prev = 0.0;
+        for (int i = 0; i < 36; i++) {
+            args->err16_CGM_ISF_trend_mean_diff_early[i] = NAN;
+            args->err16_CGM_ISF_trend_mean_ratio_early[i] = NAN;
+        }
+        for (int i = 0; i < 865; i++)
+            args->err16_CGM_ISF_trend_mean_max_temp_early[i] = NAN;
+
+        args->err16_cal_day_d_ref = 0.0;
+        args->err16_cal_day_d_temp = 0.0;
+        args->err16_cal_day_n_ref = 0.0;
+        args->err16_time5_first = 0;
+        memset(args->err16_dt_arr, 0, sizeof(args->err16_dt_arr));
+
+        /* Initialize debug err16 fields to NaN */
+        debug->err16_CGM_ISF_smooth = NAN;
+        debug->err16_CGM_plasma = NAN;
+        debug->err16_CGM_ISF_roc_value = NAN;
+
+        return;  /* Phase 0 complete, skip remaining phases */
+    }
+
+    /* ── Phase 1: Entry gate (seq >= 280) ──
+     *
+     * Binary ref: line 928 (0x67134): cmp.w r12, #0x118
+     * Only proceed with the main err16 logic if seq >= 280 (0x118).
+     * If seq < 280, we still perform history array shifting but skip
+     * the smoothing, trend, and validation phases.
+     */
+
+    /* Initialize debug outputs to safe defaults */
+    debug->err16_CGM_ISF_smooth = NAN;
+    debug->err16_CGM_plasma = NAN;
+    debug->err16_CGM_ISF_roc_value = NAN;
+    debug->err16_CGM_ISF_roc_steady = NAN;
+    debug->err16_CGM_ISF_roc_min_temp = NAN;
+    debug->err16_CGM_ISF_roc_min = NAN;
+    debug->err16_CGM_ISF_roc_diff = NAN;
+    debug->err16_CGM_ISF_roc_ratio = NAN;
+    debug->err16_CGM_ISF_trend_min_value = NAN;
+    debug->err16_CGM_ISF_trend_min_slope1 = NAN;
+    debug->err16_CGM_ISF_trend_min_slope2 = NAN;
+    debug->err16_CGM_ISF_trend_min_rsq1 = NAN;
+    debug->err16_CGM_ISF_trend_min_rsq2 = NAN;
+    debug->err16_CGM_ISF_trend_min_diff = NAN;
+    debug->err16_CGM_ISF_trend_min_max_temp = NAN;
+    debug->err16_CGM_ISF_trend_min_max = NAN;
+    debug->err16_CGM_ISF_trend_min_ratio = NAN;
+    debug->err16_CGM_ISF_trend_mode_value = NAN;
+    debug->err16_CGM_ISF_trend_mode_proportion = NAN;
+    debug->err16_CGM_ISF_trend_mode_diff = NAN;
+    debug->err16_CGM_ISF_trend_mode_max_temp = NAN;
+    debug->err16_CGM_ISF_trend_mode_max = NAN;
+    debug->err16_CGM_ISF_trend_mode_ratio = NAN;
+    debug->err16_CGM_ISF_trend_mean_value = NAN;
+    debug->err16_CGM_ISF_trend_mean_slope = NAN;
+    debug->err16_CGM_ISF_trend_mean_rsq = NAN;
+    debug->err16_CGM_ISF_trend_mean_diff = NAN;
+    debug->err16_CGM_ISF_trend_mean_max_temp = NAN;
+    debug->err16_CGM_ISF_trend_mean_max = NAN;
+    debug->err16_CGM_ISF_trend_mean_ratio = NAN;
+    debug->err16_CGM_ISF_trend_mean_diff_early = NAN;
+    debug->err16_CGM_ISF_trend_mean_max_temp_early = NAN;
+    debug->err16_CGM_ISF_trend_mean_max_early = NAN;
+    debug->err16_CGM_ISF_trend_mean_ratio_early = NAN;
+    debug->err16_cal_cons_d_usercal_after = NAN;
+    debug->err16_cal_day_d_temp = NAN;
+    debug->err16_cal_day_d_ref = NAN;
+    debug->err16_cal_day_n_ref = NAN;
+    debug->error_code16 = 0;
+    memset(debug->err16_condi, 0, sizeof(debug->err16_condi));
+
+    /* ── Phase 2: History array shifting ──
+     *
+     * Binary ref: lines 930-1093 (0x6713c-0x67324)
+     * Before the main computation, shift history arrays left by one
+     * position to make room for new values at the current index.
+     *
+     * This happens for ALL seq values (not gated by seq >= 280).
+     * The binary shifts ~20 different arrays, each 36 or 865 elements.
+     */
+
+    /* Shift 36-element trend arrays left by 1 */
+    memmove(args->err16_CGM_ISF_trend_min_slope1,
+            args->err16_CGM_ISF_trend_min_slope1 + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_min_slope1[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_min_slope2,
+            args->err16_CGM_ISF_trend_min_slope2 + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_min_slope2[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_min_rsq1,
+            args->err16_CGM_ISF_trend_min_rsq1 + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_min_rsq1[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_min_rsq2,
+            args->err16_CGM_ISF_trend_min_rsq2 + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_min_rsq2[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_min_diff,
+            args->err16_CGM_ISF_trend_min_diff + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_min_diff[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_min_ratio,
+            args->err16_CGM_ISF_trend_min_ratio + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_min_ratio[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mode_proportion,
+            args->err16_CGM_ISF_trend_mode_proportion + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_mode_proportion[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mode_diff,
+            args->err16_CGM_ISF_trend_mode_diff + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_mode_diff[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mode_ratio,
+            args->err16_CGM_ISF_trend_mode_ratio + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_mode_ratio[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mean_slope,
+            args->err16_CGM_ISF_trend_mean_slope + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_mean_slope[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mean_rsq,
+            args->err16_CGM_ISF_trend_mean_rsq + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_mean_rsq[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mean_diff,
+            args->err16_CGM_ISF_trend_mean_diff + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_mean_diff[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mean_ratio,
+            args->err16_CGM_ISF_trend_mean_ratio + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_mean_ratio[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mean_diff_early,
+            args->err16_CGM_ISF_trend_mean_diff_early + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_mean_diff_early[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mean_ratio_early,
+            args->err16_CGM_ISF_trend_mean_ratio_early + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_trend_mean_ratio_early[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_roc_steady,
+            args->err16_CGM_ISF_roc_steady + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_roc_steady[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_roc_diff,
+            args->err16_CGM_ISF_roc_diff + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_roc_diff[35] = NAN;
+
+    memmove(args->err16_CGM_ISF_roc_ratio,
+            args->err16_CGM_ISF_roc_ratio + 1,
+            35 * sizeof(double));
+    args->err16_CGM_ISF_roc_ratio[35] = NAN;
+
+    memmove(args->err16_CGM_plasma,
+            args->err16_CGM_plasma + 1,
+            35 * sizeof(double));
+    args->err16_CGM_plasma[35] = NAN;
+
+    memmove(args->err16_dt_arr,
+            args->err16_dt_arr + 1,
+            35 * sizeof(double));
+    args->err16_dt_arr[35] = NAN;
+
+    /* Shift 865-element arrays left by 1 */
+    memmove(args->err16_CGM_ISF_roc_value,
+            args->err16_CGM_ISF_roc_value + 1,
+            576 * sizeof(double));
+    args->err16_CGM_ISF_roc_value[576] = NAN;
+
+    memmove(args->err16_CGM_ISF_roc_min_temp,
+            args->err16_CGM_ISF_roc_min_temp + 1,
+            864 * sizeof(double));
+    args->err16_CGM_ISF_roc_min_temp[864] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_min_value_arr,
+            args->err16_CGM_ISF_trend_min_value_arr + 1,
+            864 * sizeof(double));
+    args->err16_CGM_ISF_trend_min_value_arr[864] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_min_max_temp,
+            args->err16_CGM_ISF_trend_min_max_temp + 1,
+            864 * sizeof(double));
+    args->err16_CGM_ISF_trend_min_max_temp[864] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mode_max_temp,
+            args->err16_CGM_ISF_trend_mode_max_temp + 1,
+            864 * sizeof(double));
+    args->err16_CGM_ISF_trend_mode_max_temp[864] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mean_value_arr,
+            args->err16_CGM_ISF_trend_mean_value_arr + 1,
+            864 * sizeof(double));
+    args->err16_CGM_ISF_trend_mean_value_arr[864] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mean_max_temp,
+            args->err16_CGM_ISF_trend_mean_max_temp + 1,
+            864 * sizeof(double));
+    args->err16_CGM_ISF_trend_mean_max_temp[864] = NAN;
+
+    memmove(args->err16_CGM_ISF_trend_mean_max_temp_early,
+            args->err16_CGM_ISF_trend_mean_max_temp_early + 1,
+            864 * sizeof(double));
+    args->err16_CGM_ISF_trend_mean_max_temp_early[864] = NAN;
+
+    /* Shift ISF smooth array left by 1 */
+    memmove(args->err16_CGM_ISF_smooth,
+            args->err16_CGM_ISF_smooth + 1,
+            864 * sizeof(double));
+    args->err16_CGM_ISF_smooth[864] = NAN;
+
+    /* Compute dt (time difference) for current reading.
+     *
+     * Binary ref: line 1094-1134 (0x67326-0x673aa)
+     * dt = (measurement_time - err16_time5_first) / 60.0
+     * This is stored in debug and used for trend rate computations.
+     *
+     * TODO: Verify the exact time source mapping with oracle.
+     */
+    uint32_t time_now = debug->measurement_time_standard;
+    uint32_t time_first = args->err16_time5_first;
+    if (time_first == 0)
+        time_first = time_now;
+    double dt = (double)(time_now - time_first) / 60.0;
+    args->err16_dt_arr[35] = dt;
+
+    if (seq_val < 280) {
+        /* Not enough data — skip smoothing, trend, validation.
+         * Binary: beq.w 0x67326 at line 929 (branches when == 280,
+         * meaning < 280 takes the shift-only path, >= 280 enters
+         * main logic).
+         */
+        debug->error_code16 = 0;
+        return;
+    }
+
+    /* ── Phase 3: ISF Smooth computation ──
+     *
+     * Binary ref: lines 1094-1417 (0x67326-0x67730)
+     * Calls smooth1q_err16 twice:
+     *   1st call: smooth the ISF data, compute CGM_plasma
+     *   2nd call: smooth the plasma data for trend analysis
+     *
+     * The smoothing window size comes from dev_info+0x700 area,
+     * which maps to err6_CGM_BLE_bad[0] in our packed struct.
+     *
+     * TODO: Verify dev_info field mapping for smoothing params.
+     */
+    uint16_t smooth_n = dev_info->err6_CGM_BLE_bad[0];
+    if (smooth_n == 0)
+        smooth_n = 36;  /* Sane default if device config is zero */
+    if (smooth_n > 50)
+        smooth_n = 50;  /* smooth1q_err16 max is 50 */
+
+    /* Count valid accu_seq entries for the smoothing window */
+    uint16_t seq_final = debug->seq_number_final;
+    int16_t lower_bound = (int16_t)seq_final - (int16_t)smooth_n;
+    uint16_t n_valid = 0;
+    for (int i = 0; i < 865; i++) {
+        uint16_t s = args->accu_seq[i];
+        if (s == 0)
+            continue;
+        if (s <= seq_final && (int16_t)s > lower_bound)
+            n_valid++;
+    }
+
+    /* Stack-allocated smoothing buffers for smooth1q_err16 */
+    double smooth_buf1[50];
+    double smooth_buf2[50];
+    memset(smooth_buf1, 0, sizeof(smooth_buf1));
+    memset(smooth_buf2, 0, sizeof(smooth_buf2));
+
+    /* Copy the last n_valid ISF smooth values into the smoothing buffer */
+    uint16_t copy_n = (n_valid < smooth_n) ? n_valid : smooth_n;
+    if (copy_n > 50) copy_n = 50;
+
+    if (copy_n > 0 && n_valid == smooth_n) {
+        /* Extract the tail of the ISF smooth array */
+        for (uint16_t i = 0; i < copy_n; i++) {
+            uint16_t src_idx = (865 > copy_n) ? (865 - copy_n + i) : i;
+            if (src_idx < 865)
+                smooth_buf1[i] = args->err16_CGM_ISF_smooth[src_idx];
+        }
+
+        /* 1st smooth call: smooth the ISF data */
+        smooth1q_err16(smooth_buf1, copy_n, smooth_buf2);
+
+        /* Store smoothed last value to debug */
+        debug->err16_CGM_ISF_smooth = smooth_buf2[copy_n - 1];
+
+        /*
+         * Binary ref: lines 1394-1416 (0x676e6-0x67730)
+         * Compute CGM_plasma from smoothed ISF:
+         *   plasma = (smoothed_isf[last-1]) / (slope * scale) * round_factor
+         *
+         * The computation involves dev_info fields at dev_info+0x700
+         * and other calibration parameters. Simplified version:
+         *   Store math_round(smoothed_value) to debug->err16_CGM_plasma
+         *
+         * TODO: Verify exact plasma computation with oracle.
+         */
+        double smoothed_val = smooth_buf2[copy_n - 1];
+        double rounded_smooth = math_round(smoothed_val);
+        debug->err16_CGM_plasma = rounded_smooth;
+        args->err16_CGM_plasma[35] = rounded_smooth;
+
+        /* 2nd smooth call: smooth the plasma data */
+        double plasma_buf[50];
+        double plasma_out[50];
+        memset(plasma_buf, 0, sizeof(plasma_buf));
+        memset(plasma_out, 0, sizeof(plasma_out));
+
+        for (uint16_t i = 0; i < copy_n && i < 36; i++) {
+            uint16_t src_idx = (36 > copy_n) ? (36 - copy_n + i) : i;
+            if (src_idx < 36)
+                plasma_buf[i] = args->err16_CGM_plasma[src_idx];
+        }
+
+        smooth1q_err16(plasma_buf, copy_n, plasma_out);
+        double rounded_plasma = math_round(plasma_out[copy_n - 1]);
+        (void)rounded_plasma;  /* Used for downstream trend, stored via trend calls */
+    } else {
+        /* Insufficient data for smoothing: set outputs to NaN and skip
+         * trend computation. */
+        debug->err16_CGM_ISF_smooth = NAN;
+        debug->err16_CGM_plasma = NAN;
+        debug->error_code16 = 0;
+        return;
+    }
+
+    /* ── Phase 4: Trend computation (3 passes) ──
+     *
+     * Binary ref: lines 1430-1758 (0x67766-0x67b56)
+     * Three calls to f_cgm_trend for min, mode, and mean trends:
+     *   Pass 0 (mode=0): min trend — 10th percentile reference
+     *   Pass 1 (mode=2): mode trend — quantized mode reference
+     *   Pass 2 (mode=1): mean trend — trimmed mean reference
+     *
+     * Each call computes:
+     *   - trend_value, trend_n
+     *   - slope1, slope2 (regression slopes)
+     *   - rsq1, rsq2 (R-squared values)
+     *   - diff, ratio (deviation from reference)
+     *   - max values (running maximums)
+     *
+     * The parameters come from dev_info err6_* fields at various offsets.
+     *
+     * TODO: Verify dev_info offset mappings for all trend parameters.
+     */
+
+    /*
+     * Build the result buffer for f_cgm_trend.
+     * f_cgm_trend writes multiple fields at specific offsets in a result
+     * array, which we then copy to the appropriate args fields.
+     */
+    double trend_result[48];
+    memset(trend_result, 0, sizeof(trend_result));
+
+    /* min_n and n_back parameters from dev_info.
+     * Binary loads these from dev_info+0x708..0x734 area.
+     * In packed struct, these map to err6_CGM_* fields.
+     *
+     * TODO: Verify mapping with oracle. Using defaults for now.
+     */
+    double min_n_param = 3.0;
+    double n_back_param = (double)smooth_n;
+    double ref_value = 0.0;
+    uint16_t roc_ptr_dummy = 0;
+
+    /* Pass 0: min trend (mode = 0) */
+    f_cgm_trend(args, args->accu_seq, trend_result, seq_val,
+                min_n_param, n_back_param, ref_value,
+                &roc_ptr_dummy, 0, 0, dev_info->cal_trendRate);
+
+    /* Store min trend results to args and debug */
+    args->err16_CGM_ISF_trend_min_value = trend_result[0];
+    debug->err16_CGM_ISF_trend_min_value = trend_result[0];
+    args->err16_CGM_ISF_trend_min_n = trend_result[3];
+
+    /* Store slopes/rsq to the last position (index 35) of trend arrays */
+    args->err16_CGM_ISF_trend_min_slope1[35] = trend_result[5];
+    debug->err16_CGM_ISF_trend_min_slope1 = trend_result[5];
+    args->err16_CGM_ISF_trend_min_slope2[35] = trend_result[7];
+    debug->err16_CGM_ISF_trend_min_slope2 = trend_result[7];
+    args->err16_CGM_ISF_trend_min_rsq1[35] = trend_result[9];
+    debug->err16_CGM_ISF_trend_min_rsq1 = trend_result[9];
+    args->err16_CGM_ISF_trend_min_rsq2[35] = trend_result[11];
+    debug->err16_CGM_ISF_trend_min_rsq2 = trend_result[11];
+    args->err16_CGM_ISF_trend_min_diff[35] = trend_result[13];
+    debug->err16_CGM_ISF_trend_min_diff = trend_result[13];
+    args->err16_CGM_ISF_trend_min_ratio[35] = trend_result[15];
+    debug->err16_CGM_ISF_trend_min_ratio = trend_result[15];
+
+    /* Store value to value_arr at current position */
+    if (seq_val > 0 && seq_val <= 865) {
+        args->err16_CGM_ISF_trend_min_value_arr[seq_val - 1] =
+            args->err16_CGM_ISF_trend_min_value;
+    }
+
+    /* Update min max tracking */
+    if (!isnan(args->err16_CGM_ISF_trend_min_value)) {
+        if (args->err16_CGM_ISF_trend_min_value >
+            args->err16_CGM_ISF_trend_min_max) {
+            args->err16_CGM_ISF_trend_min_max =
+                args->err16_CGM_ISF_trend_min_value;
+        }
+    }
+    debug->err16_CGM_ISF_trend_min_max = args->err16_CGM_ISF_trend_min_max;
+    if (seq_val > 0 && seq_val <= 865) {
+        args->err16_CGM_ISF_trend_min_max_temp[seq_val - 1] =
+            args->err16_CGM_ISF_trend_min_max;
+    }
+    debug->err16_CGM_ISF_trend_min_max_temp =
+        args->err16_CGM_ISF_trend_min_max;
+
+    /* Preserve prev value */
+    args->err16_CGM_ISF_trend_min_value_prev =
+        args->err16_CGM_ISF_trend_min_value;
+    args->err16_CGM_ISF_trend_min_max_prev =
+        args->err16_CGM_ISF_trend_min_max;
+
+    /* Pass 1: mode trend (mode = 2) */
+    memset(trend_result, 0, sizeof(trend_result));
+    f_cgm_trend(args, args->accu_seq, trend_result, seq_val,
+                min_n_param, n_back_param, ref_value,
+                &roc_ptr_dummy, 2, 0, dev_info->cal_trendRate);
+
+    args->err16_CGM_ISF_trend_mode_value = trend_result[0];
+    debug->err16_CGM_ISF_trend_mode_value = trend_result[0];
+    args->err16_CGM_ISF_trend_mode_n = trend_result[3];
+
+    args->err16_CGM_ISF_trend_mode_proportion[35] = trend_result[5];
+    debug->err16_CGM_ISF_trend_mode_proportion = trend_result[5];
+    args->err16_CGM_ISF_trend_mode_diff[35] = trend_result[7];
+    debug->err16_CGM_ISF_trend_mode_diff = trend_result[7];
+    args->err16_CGM_ISF_trend_mode_ratio[35] = trend_result[9];
+    debug->err16_CGM_ISF_trend_mode_ratio = trend_result[9];
+
+    /* Update mode max tracking */
+    if (!isnan(args->err16_CGM_ISF_trend_mode_value)) {
+        if (args->err16_CGM_ISF_trend_mode_value >
+            args->err16_CGM_ISF_trend_mode_max) {
+            args->err16_CGM_ISF_trend_mode_max =
+                args->err16_CGM_ISF_trend_mode_value;
+        }
+    }
+    debug->err16_CGM_ISF_trend_mode_max = args->err16_CGM_ISF_trend_mode_max;
+    if (seq_val > 0 && seq_val <= 865) {
+        args->err16_CGM_ISF_trend_mode_max_temp[seq_val - 1] =
+            args->err16_CGM_ISF_trend_mode_max;
+    }
+    debug->err16_CGM_ISF_trend_mode_max_temp =
+        args->err16_CGM_ISF_trend_mode_max;
+
+    args->err16_CGM_ISF_trend_mode_value_prev =
+        args->err16_CGM_ISF_trend_mode_value;
+    args->err16_CGM_ISF_trend_mode_max_prev =
+        args->err16_CGM_ISF_trend_mode_max;
+
+    /* Pass 2: mean trend (mode = 1) */
+    memset(trend_result, 0, sizeof(trend_result));
+    f_cgm_trend(args, args->accu_seq, trend_result, seq_val,
+                min_n_param, n_back_param, ref_value,
+                &roc_ptr_dummy, 1, 0, dev_info->cal_trendRate);
+
+    args->err16_CGM_ISF_trend_mean_value = trend_result[0];
+    debug->err16_CGM_ISF_trend_mean_value = trend_result[0];
+    args->err16_CGM_ISF_trend_mean_n = trend_result[3];
+
+    args->err16_CGM_ISF_trend_mean_slope[35] = trend_result[5];
+    debug->err16_CGM_ISF_trend_mean_slope = trend_result[5];
+    args->err16_CGM_ISF_trend_mean_rsq[35] = trend_result[7];
+    debug->err16_CGM_ISF_trend_mean_rsq = trend_result[7];
+    args->err16_CGM_ISF_trend_mean_diff[35] = trend_result[9];
+    debug->err16_CGM_ISF_trend_mean_diff = trend_result[9];
+    args->err16_CGM_ISF_trend_mean_ratio[35] = trend_result[11];
+    debug->err16_CGM_ISF_trend_mean_ratio = trend_result[11];
+
+    /* Store to value_arr */
+    if (seq_val > 0 && seq_val <= 865) {
+        args->err16_CGM_ISF_trend_mean_value_arr[seq_val - 1] =
+            args->err16_CGM_ISF_trend_mean_value;
+    }
+
+    /* Update mean max tracking */
+    if (!isnan(args->err16_CGM_ISF_trend_mean_value)) {
+        if (args->err16_CGM_ISF_trend_mean_value >
+            args->err16_CGM_ISF_trend_mean_max) {
+            args->err16_CGM_ISF_trend_mean_max =
+                args->err16_CGM_ISF_trend_mean_value;
+        }
+    }
+    debug->err16_CGM_ISF_trend_mean_max = args->err16_CGM_ISF_trend_mean_max;
+    if (seq_val > 0 && seq_val <= 865) {
+        args->err16_CGM_ISF_trend_mean_max_temp[seq_val - 1] =
+            args->err16_CGM_ISF_trend_mean_max;
+    }
+    debug->err16_CGM_ISF_trend_mean_max_temp =
+        args->err16_CGM_ISF_trend_mean_max;
+
+    /* Mean early diff/ratio tracking */
+    args->err16_CGM_ISF_trend_mean_diff_early[35] = trend_result[13];
+    debug->err16_CGM_ISF_trend_mean_diff_early = trend_result[13];
+    args->err16_CGM_ISF_trend_mean_ratio_early[35] = trend_result[15];
+    debug->err16_CGM_ISF_trend_mean_ratio_early = trend_result[15];
+
+    if (!isnan(trend_result[13])) {
+        double abs_early = fabs(trend_result[13]);
+        if (abs_early > args->err16_CGM_ISF_trend_mean_max_early) {
+            args->err16_CGM_ISF_trend_mean_max_early = abs_early;
+        }
+    }
+    debug->err16_CGM_ISF_trend_mean_max_early =
+        args->err16_CGM_ISF_trend_mean_max_early;
+    if (seq_val > 0 && seq_val <= 865) {
+        args->err16_CGM_ISF_trend_mean_max_temp_early[seq_val - 1] =
+            args->err16_CGM_ISF_trend_mean_max_early;
+    }
+    debug->err16_CGM_ISF_trend_mean_max_temp_early =
+        args->err16_CGM_ISF_trend_mean_max_early;
+
+    args->err16_CGM_ISF_trend_mean_value_prev =
+        args->err16_CGM_ISF_trend_mean_value;
+    args->err16_CGM_ISF_trend_mean_max_prev =
+        args->err16_CGM_ISF_trend_mean_max;
+    args->err16_CGM_ISF_trend_mean_max_early_prev =
+        args->err16_CGM_ISF_trend_mean_max_early;
+
+    /* ── Phase 5: Trend validation ──
+     *
+     * Binary ref: lines ~1787-2700 (0x67bc0-0x68704)
+     * Three calls to f_check_cgm_trend for min/mode/mean validation.
+     * Results stored in err16_condi[0..6].
+     *
+     * The validation checks trend slopes/ratios against thresholds
+     * from dev_info. The mode parameter controls which checks are
+     * performed (100 for simple le check, <=2 for 3-array check, etc).
+     *
+     * Binary flow:
+     *   - First call (min): mode from dev_info, validates slope1/slope2
+     *     -> stores result to debug+0x88f (err16_condi[0])
+     *   - Inline validation loop for mode trend (condi[1..3])
+     *   - Second call (mode/mean): validates another set
+     *     -> stores result to debug+0x890 (err16_condi[1])
+     *   - Third call (mean with early data): mode from dev_info
+     *     -> stores result to debug+0x891 (err16_condi[2])
+     *   - Additional inline checks for condi[3..6]
+     *
+     * TODO: Verify exact threshold mappings and validation modes.
+     */
+
+    /* Load validation threshold from dev_info.
+     * Binary accesses dev_info+0x418 (errcode_version area).
+     * In our packed struct, this maps to err345_seq1[0].
+     *
+     * TODO: Verify mapping with oracle. */
+    uint16_t validation_threshold = dev_info->err345_seq1[0];
+
+    /* First f_check_cgm_trend call for min trend */
+    if (seq_final > validation_threshold && validation_threshold > 0) {
+        /* Build arrays for f_check_cgm_trend.
+         * The binary loads slope1, slope2, diff, ratio arrays into
+         * stack-based pointer arrays and calls f_check_cgm_trend.
+         *
+         * TODO: Verify array selection and modes with oracle.
+         */
+        double *min_arrays[6];
+        min_arrays[0] = args->err16_CGM_ISF_trend_min_slope1;
+        min_arrays[1] = args->err16_CGM_ISF_trend_min_slope2;
+        min_arrays[2] = args->err16_CGM_ISF_trend_min_diff;
+        min_arrays[3] = args->err16_CGM_ISF_trend_min_rsq1;
+        min_arrays[4] = args->err16_CGM_ISF_trend_min_rsq2;
+        min_arrays[5] = args->err16_CGM_ISF_trend_min_ratio;
+
+        /* Thresholds from dev_info err6 area.
+         * TODO: Verify mappings. Using placeholder thresholds. */
+        double min_thresholds[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        uint8_t min_comp_modes[6] = {4, 4, 4, 4, 4, 4}; /* le=4 */
+
+        uint8_t min_result = f_check_cgm_trend(
+            100,   /* mode 100 = simple 2-array le check */
+            args, seq_val,
+            smooth_n,
+            min_arrays, 2,
+            min_thresholds, 2,
+            min_comp_modes);
+        debug->err16_condi[0] = min_result;
+    }
+
+    /* Second f_check_cgm_trend call for mode trend */
+    {
+        double *mode_arrays[6];
+        mode_arrays[0] = args->err16_CGM_ISF_trend_mode_proportion;
+        mode_arrays[1] = args->err16_CGM_ISF_trend_mode_diff;
+        mode_arrays[2] = args->err16_CGM_ISF_trend_mode_ratio;
+
+        double mode_thresholds[3] = {0.0, 0.0, 0.0};
+        uint8_t mode_comp_modes[3] = {4, 4, 4};
+
+        uint8_t mode_result = f_check_cgm_trend(
+            1,   /* mode <= 2 */
+            args, seq_val,
+            smooth_n,
+            mode_arrays, 3,
+            mode_thresholds, 3,
+            mode_comp_modes);
+        debug->err16_condi[1] = mode_result;
+    }
+
+    /* Third f_check_cgm_trend call for mean trend */
+    {
+        double *mean_arrays[6];
+        mean_arrays[0] = args->err16_CGM_ISF_trend_mean_slope;
+        mean_arrays[1] = args->err16_CGM_ISF_trend_mean_rsq;
+        mean_arrays[2] = args->err16_CGM_ISF_trend_mean_diff;
+        mean_arrays[3] = args->err16_CGM_ISF_trend_mean_ratio;
+        mean_arrays[4] = args->err16_CGM_ISF_trend_mean_diff_early;
+        mean_arrays[5] = args->err16_CGM_ISF_trend_mean_ratio_early;
+
+        double mean_thresholds[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        uint8_t mean_comp_modes[6] = {4, 4, 1, 1, 4, 4};
+
+        uint8_t mean_result = f_check_cgm_trend(
+            3,   /* mode > 2 */
+            args, seq_val,
+            smooth_n,
+            mean_arrays, 6,
+            mean_thresholds, 6,
+            mean_comp_modes);
+        debug->err16_condi[2] = mean_result;
+    }
+
+    /* ── Phase 6: Final decision ──
+     *
+     * Binary ref: lines 2998-3012 (0x68acc-0x68ae6)
+     * Iterate through err16_condi[0..6]:
+     *   If ANY condi[i] == 1, set error_code16 = 1.
+     *
+     * Binary stores to debug+0x7ac (error_code16 in debug struct).
+     *
+     * There are also additional inline checks (condi[3..6]) that
+     * are computed from early-data validators and time-based checks.
+     * These follow the pattern at lines 2700-2998 in the binary.
+     *
+     * For the initial implementation, we check condi[0..6] from the
+     * above validation calls. The additional inline checks set
+     * condi[3..6] based on sensor age, calibration history, and
+     * absolute trend deviations. These are complex time-based checks
+     * that will be refined with oracle testing.
+     *
+     * TODO: Implement condi[3..6] inline checks from binary lines
+     * 2700-2998. These involve:
+     *   - condi[3]: sensor age check (measurement_time vs sensor_start_time)
+     *   - condi[4]: calibration trend rate check
+     *   - condi[5]: absolute ISF deviation check
+     *   - condi[6]: combined deviation + trend check
+     */
+
+    /* Check if ANY condition is set */
+    uint8_t any_set = 0;
+    for (int i = 0; i < 7; i++) {
+        if (debug->err16_condi[i] == 1) {
+            any_set = 1;
+            break;
+        }
+    }
+
+    debug->error_code16 = any_set;
+
+    /* Store result_prev for next iteration */
+    args->err16_result_prev = debug->error_code16;
 }
 
 /* ────────────────────────────────────────────────────────────────────
