@@ -185,10 +185,18 @@ void regress_cal(struct air1_opcal4_arguments_t *args,
      * For our implementation, we access CalLog entries directly. */
 
     if (cal_state == (int8_t)0xFF) {
-        /* Uncalibrated: use factory defaults from args
-         * (disasm at 0x6cef4: loads from args + 0x2dc0 + 64 and +72)
-         * These correspond to default slope/intercept. */
-        goto use_defaults;
+        /* Uncalibrated: seed with factory reference values and run regression.
+         * (disasm at 0x6cef4-0x6cf0c: loads from args + 0x2dc0 + 64 (slope)
+         *  and +72 (intercept), stores into x_buf[0] and y_buf[0],
+         *  sets n_valid=1, then falls through to regression at 0x6cf70.)
+         *
+         * The binary does NOT simply copy defaults — it creates a single
+         * calibration point from the factory values and runs IRLS on it
+         * together with the extrapolated points. */
+        x_buf[0] = args->cal_result_slope[0];  /* offset +64 from CalLog base */
+        y_buf[0] = args->cal_result_ycept[0];  /* offset +72 from CalLog base */
+        n_valid = 1;
+        goto run_regression;
     }
 
     /* Determine age threshold based on cal_state */
@@ -242,6 +250,7 @@ void regress_cal(struct air1_opcal4_arguments_t *args,
         goto use_defaults;
     }
 
+run_regression:
     /* ── Extend collected data with extrapolated points ──
      * (disasm at 0x6cf70-0x6d03c)
      * The function computes means of x and y, then appends additional
@@ -254,6 +263,8 @@ void regress_cal(struct air1_opcal4_arguments_t *args,
         /* Clamp extended count to coef_length from dev_info
          * (disasm: ldrb r0, [r2, #0x2b0] which is dev_info->w_sg_x100[0]
          *  area... actually this is a count limiter) */
+        /* Binary uses ldrb (byte load) at 0x6cfa4, intentionally truncating
+         * the uint16_t coef_length to 8 bits. We match this behavior. */
         uint8_t max_points = (uint8_t)dev_info->coef_length;
         if ((uint8_t)n_valid > max_points) {
             n_valid = max_points;
@@ -363,15 +374,20 @@ void regress_cal(struct air1_opcal4_arguments_t *args,
             for (int i = 0; i < total_n; i++) {
                 double u = residuals[i] / s;
 
-                /* Bisquare weight:
-                 *   if |u| < 1: w = (1 - u^2)^2
-                 *   else: w = 0
-                 * (disasm at 0x6d31c-0x6d344) */
+                /* Bisquare weight from disasm at 0x6d31c-0x6d344:
+                 *   d18 = 1.0 - u*u  (vmls d18, d17, d17 where d18=d13=1.0)
+                 *   vcmp d17, d13     (compare u against 1.0)
+                 *   d17 = 0.0         (vmov.i32 d17, #0x0)
+                 *   d18 = d18 * d18   (vmul d18, d18, d18)
+                 *   it mi: d17 = d18  (if u < 1.0, use bisquare weight)
+                 *
+                 * The binary only checks u < 1.0 (not |u| < 1). This means
+                 * large negative u values get the bisquare weight applied.
+                 * We match the binary exactly for oracle verification. */
                 double w_val = 1.0 - u * u;
-                if (u < 1.0 && u > -1.0) {
-                    /* vcmp d17, d13 (d13 = 1.0)
-                     * if u < 1.0: w = (1 - u^2)^2 */
-                    w[i] = w_val * w_val;
+                w_val = w_val * w_val;
+                if (u < 1.0) {
+                    w[i] = w_val;
                 } else {
                     w[i] = 0.0;
                 }
@@ -470,6 +486,10 @@ use_defaults:
  * in the main algorithm and err16 detector. This implementation
  * follows the structural logic from the disassembly.
  * ──────────────────────────────────────────────────────────────────── */
+/* NOTE: This function allocates ~41 KB on the stack (isf_data[865] +
+ * quantized[865] + reg_x[865] + reg_y[865]). This matches the binary's
+ * stack frame size (sub sp, sp, #0xa400 at function entry). Callers
+ * must ensure sufficient stack space. */
 void f_cgm_trend(struct air1_opcal4_arguments_t *args,
                  void *accu_seq_base,
                  double *result,
@@ -500,7 +520,10 @@ void f_cgm_trend(struct air1_opcal4_arguments_t *args,
      * It's accessed at offset 0xc9c0 from args in the disassembly. */
 
     uint16_t idx = args->idx;
-    (void)accu_seq_base; /* used for seq validation in full integration */
+    /* accu_seq_base is passed by the caller (err16 detector) for sequence
+     * validation in the full integration. Not used in standalone trend
+     * computation — we access accu_seq via args->accu_seq instead. */
+    (void)accu_seq_base;
 
     /* Count valid sequences in the window
      * (disasm at 0x6da10-0x6da28)
@@ -517,7 +540,7 @@ void f_cgm_trend(struct air1_opcal4_arguments_t *args,
     if (seq_start < 0) seq_start = 0;
 
     for (int i = 0; i < n_back_int && i < CGM_SEQ_SLOTS; i++) {
-        uint16_t seq_val = args->accu_seq[idx + i < CGM_SEQ_SLOTS ? idx + i : i];
+        uint16_t seq_val = args->accu_seq[(idx + i) % CGM_SEQ_SLOTS];
         if (seq_val != 0 && seq_val <= seq_current &&
             (int)seq_current - (int)seq_val <= n_back_int) {
             n_valid_seq++;
@@ -667,7 +690,10 @@ void f_cgm_trend(struct air1_opcal4_arguments_t *args,
      * Pass 0: compute trend over the full window
      * Pass 1: compute trend over a sub-window (using result_roc as bounds) */
     uint32_t n_passes = (trend_pass == 0) ? 2 : (uint32_t)trend_pass;
-    (void)cal_trendRate; /* used for threshold checks in full integration */
+    /* cal_trendRate is used for threshold comparisons in the full err16
+     * detector integration (disasm at 0x6de38). Not needed for standalone
+     * trend computation since the threshold check is in the caller. */
+    (void)cal_trendRate;
 
     for (uint32_t pass = 0; pass < n_passes; pass++) {
         /* Prepare x (time) and y (ISF) arrays for regression */
@@ -711,16 +737,10 @@ void f_cgm_trend(struct air1_opcal4_arguments_t *args,
             double abs_val = fabs(val);
             if (isnan(abs_val) || isinf(abs_val)) continue;
 
-            /* Sample at regular intervals based on n_sub */
-            if (n_sub > 0 && (n_reg % n_sub) == 0) {
-                /* Compute time offset */
-                /* In the disasm, time is derived from accu_seq differences
-                 * divided by 288 (d14). For our implementation we use
-                 * the array index as time proxy. */
-                reg_x[n_reg] = (double)i / CGM_TIME_DIVISOR;
-            } else {
-                reg_x[n_reg] = (double)i / CGM_TIME_DIVISOR;
-            }
+            /* Compute time offset: index normalized by CGM_TIME_DIVISOR (288).
+             * In the disasm, time is derived from accu_seq differences
+             * divided by 288 (d14). We use the array index as time proxy. */
+            reg_x[n_reg] = (double)i / CGM_TIME_DIVISOR;
             reg_y[n_reg] = val;
             n_reg++;
         }
@@ -741,7 +761,7 @@ void f_cgm_trend(struct air1_opcal4_arguments_t *args,
         double reg_result[2]; /* [slope, intercept] */
         fit_simple_regression(reg_x, reg_y, (int)n_reg, reg_result);
 
-        double r2 = f_rsq(reg_result, reg_x, reg_y, (int)n_reg);
+        double r2 = f_rsq(reg_result, reg_y, reg_x, (int)n_reg);
 
         /* Store results based on pass number */
         if (pass == 1) {

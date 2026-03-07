@@ -14,6 +14,7 @@ endif()
 add_library(caresens_air STATIC
     src/calibration.c
     src/math_utils.c
+    src/signal_processing.c
 )
 target_include_directories(caresens_air PUBLIC src)
 

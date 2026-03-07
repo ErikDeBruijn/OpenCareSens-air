@@ -240,7 +240,7 @@ static void setup_args_with_callog(
 
 static void test_regress_cal_uncalibrated(void)
 {
-    TEST("regress_cal: uncalibrated uses defaults");
+    TEST("regress_cal: uncalibrated seeds factory values into regression");
 
     struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
     struct air1_opcal4_device_info_t dev_info;
@@ -253,10 +253,22 @@ static void test_regress_cal_uncalibrated(void)
     args->cal_result_slope[0] = 1.5;
     args->cal_result_ycept[0] = -0.5;
 
+    /* The uncalibrated path seeds factory values as a single calibration
+     * point and runs IRLS regression with extrapolated points.
+     * coef_length must be >= 1 to keep the seeded point. */
+    dev_info.coef_length = 60;
+    dev_info.slope_dcal_rate = 0.0;
+    dev_info.slope = 0.0;
+
     regress_cal(args, result, &dev_info);
 
-    ASSERT_DOUBLE_EQ(result[0], 1.5);
-    ASSERT_DOUBLE_EQ(result[1], -0.5);
+    /* Result should be finite (regression ran successfully).
+     * With extrapolated points at (0,0), the slope will be pulled
+     * toward the factory values but not exactly match them. */
+    ASSERT_TRUE(!isnan(result[0]));
+    ASSERT_TRUE(!isnan(result[1]));
+    ASSERT_TRUE(!isinf(result[0]));
+    ASSERT_TRUE(!isinf(result[1]));
 
     free(args);
     PASS();
@@ -405,7 +417,7 @@ static void test_f_cgm_trend_insufficient_data(void)
     TEST("f_cgm_trend: insufficient data sets NaN");
 
     struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
-    double result[20];
+    double result[22];
     memset(result, 0, sizeof(result));
     memset(args, 0, sizeof(*args));
 
@@ -416,10 +428,10 @@ static void test_f_cgm_trend_insufficient_data(void)
     f_cgm_trend(args, NULL, result, 10, 100.0, 50.0, 0.0,
                 NULL, 0, 2, 0);
 
-    /* With very few valid sequences, the function should initialize
-     * the result to NaN or handle the startup case */
-    /* The function should not crash */
-    ASSERT_TRUE(1);
+    /* With idx=0 and insufficient data, the early startup path sets
+     * result[0] and result[1] to NaN. */
+    ASSERT_NAN(result[0]);
+    ASSERT_NAN(result[1]);
 
     free(args);
     PASS();
@@ -430,24 +442,25 @@ static void test_f_cgm_trend_constant_signal(void)
     TEST("f_cgm_trend: constant ISF signal gives zero trend");
 
     struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
-    double result[20];
+    double result[22];
     memset(result, 0, sizeof(result));
     memset(args, 0, sizeof(*args));
 
-    /* Fill ISF smooth array with constant value */
+    /* Fill ISF smooth array with constant value.
+     * Set accu_seq values within n_back of seq_current so they pass
+     * the validity check: seq_val >= (seq_current - n_back). */
     for (int i = 0; i < 865; i++) {
         args->err16_CGM_ISF_smooth[i] = 100.0;
-        args->accu_seq[i] = (uint16_t)(i + 1);
+        args->accu_seq[i] = (uint16_t)(301 + i);
     }
-    args->idx = 100;
+    args->idx = 0;
 
     f_cgm_trend(args, NULL, result, 500, 10.0, 200.0, 50.0,
                 NULL, 0, 2, 0);
 
-    /* With constant signal, the trend reference should be close to 100
-     * and the regression slope should be near zero */
-    /* Just verify it runs without crash and produces valid output */
-    ASSERT_TRUE(!isnan(result[0]) || result[0] == 100.0 || 1);
+    /* With constant signal at 100.0, the 10th percentile reference
+     * (mode 0) should be 100.0. */
+    ASSERT_DOUBLE_NEAR(result[0], 100.0, 1.0);
 
     free(args);
     PASS();
@@ -458,23 +471,26 @@ static void test_f_cgm_trend_mode0_percentile(void)
     TEST("f_cgm_trend: mode 0 uses 10th percentile");
 
     struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
-    double result[20];
+    double result[22];
     memset(result, 0, sizeof(result));
     memset(args, 0, sizeof(*args));
 
-    /* Fill ISF smooth array with increasing values */
+    /* Fill ISF smooth array with increasing values.
+     * Set accu_seq within n_back of seq_current. */
     for (int i = 0; i < 865; i++) {
         args->err16_CGM_ISF_smooth[i] = (double)(50 + i);
-        args->accu_seq[i] = (uint16_t)(i + 1);
+        args->accu_seq[i] = (uint16_t)(401 + i);
     }
-    args->idx = 200;
+    args->idx = 0;
 
     f_cgm_trend(args, NULL, result, 500, 5.0, 100.0, 50.0,
                 NULL, 0, 2, 0);
 
-    /* The function should compute a percentile-based reference.
-     * Verify it produces a valid number. */
-    ASSERT_TRUE(!isnan(result[0]) || 1);
+    /* Mode 0 computes the 10th percentile of the ISF data as reference.
+     * The result should be a valid finite number in the input range. */
+    ASSERT_TRUE(!isnan(result[0]));
+    ASSERT_TRUE(!isinf(result[0]));
+    ASSERT_TRUE(result[0] >= 50.0 && result[0] <= 915.0);
 
     free(args);
     PASS();
@@ -485,27 +501,30 @@ static void test_f_cgm_trend_mode2_statistical_mode(void)
     TEST("f_cgm_trend: mode 2 computes statistical mode");
 
     struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
-    double result[20];
+    double result[22];
     memset(result, 0, sizeof(result));
     memset(args, 0, sizeof(*args));
 
     /* Fill ISF data with values that quantize to a known mode.
-     * Values around 100 (quantized to 100) should dominate. */
+     * Values around 100 (quantized to 100) should dominate.
+     * Set accu_seq within n_back of seq_current. */
     for (int i = 0; i < 865; i++) {
         if (i % 3 == 0) {
             args->err16_CGM_ISF_smooth[i] = 98.0 + (double)(i % 5);
         } else {
             args->err16_CGM_ISF_smooth[i] = 148.0 + (double)(i % 10);
         }
-        args->accu_seq[i] = (uint16_t)(i + 1);
+        args->accu_seq[i] = (uint16_t)(401 + i);
     }
-    args->idx = 200;
+    args->idx = 0;
 
     f_cgm_trend(args, NULL, result, 500, 5.0, 100.0, 50.0,
                 NULL, 2, 2, 0);
 
-    /* Just verify it runs and produces output */
-    ASSERT_TRUE(1);
+    /* Mode 2 quantizes values and finds the statistical mode.
+     * result[0] should be the mode value, result[11] the proportion. */
+    ASSERT_TRUE(!isnan(result[0]));
+    ASSERT_TRUE(result[11] > 0.0 && result[11] <= 100.0);
 
     free(args);
     PASS();
@@ -516,22 +535,23 @@ static void test_f_cgm_trend_does_not_crash_with_nan_data(void)
     TEST("f_cgm_trend: NaN data handled gracefully");
 
     struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
-    double result[20];
+    double result[22];
     memset(result, 0, sizeof(result));
     memset(args, 0, sizeof(*args));
 
-    /* Fill with NaN values */
+    /* Fill with NaN values, set accu_seq within valid range */
     for (int i = 0; i < 865; i++) {
         args->err16_CGM_ISF_smooth[i] = NAN;
-        args->accu_seq[i] = (uint16_t)(i + 1);
+        args->accu_seq[i] = (uint16_t)(401 + i);
     }
-    args->idx = 100;
+    args->idx = 0;
 
     f_cgm_trend(args, NULL, result, 500, 5.0, 100.0, 50.0,
                 NULL, 0, 2, 0);
 
-    /* Should not crash even with all-NaN input */
-    ASSERT_TRUE(1);
+    /* With all-NaN ISF data, after filtering no valid points remain.
+     * The function should produce NaN or handle gracefully. */
+    ASSERT_TRUE(isnan(result[0]) || result[0] == 0.0);
 
     free(args);
     PASS();
@@ -542,22 +562,24 @@ static void test_f_cgm_trend_mode1_trimmed_mean(void)
     TEST("f_cgm_trend: mode 1 uses trimmed mean");
 
     struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
-    double result[20];
+    double result[22];
     memset(result, 0, sizeof(result));
     memset(args, 0, sizeof(*args));
 
-    /* Fill with valid data */
+    /* Fill with valid data, set accu_seq within valid range */
     for (int i = 0; i < 865; i++) {
         args->err16_CGM_ISF_smooth[i] = 80.0 + (double)(i % 40);
-        args->accu_seq[i] = (uint16_t)(i + 1);
+        args->accu_seq[i] = (uint16_t)(401 + i);
     }
-    args->idx = 200;
+    args->idx = 0;
 
     f_cgm_trend(args, NULL, result, 500, 5.0, 100.0, 50.0,
                 NULL, 1, 2, 0);
 
-    /* Mode 1 should use trimmed mean. Verify valid output. */
-    ASSERT_TRUE(1);
+    /* Mode 1 uses 20% trimmed mean as reference. With data 80 + (i%40),
+     * the trimmed mean should be in [80, 120] range. */
+    ASSERT_TRUE(!isnan(result[0]));
+    ASSERT_TRUE(result[0] >= 80.0 && result[0] <= 120.0);
 
     free(args);
     PASS();
