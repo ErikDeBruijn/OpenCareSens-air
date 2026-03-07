@@ -1136,8 +1136,7 @@ void smooth1q_err16(double *input, uint32_t n, double *output)
  *   mode > 2:    4-array le check + optional extended validation (mode >= 5)
  * ======================================================================== */
 
-/* Number of accu_seq entries in the validity scan (literal pool 0xfffff93e). */
-#define ACCU_SEQ_COUNT 865
+/* Use CGM_SEQ_SLOTS (865) defined above for accu_seq validity scan. */
 
 /* Length of each trend data array (rsb r0, r4, #0x24 => 0x24 = 36). */
 #define TREND_ARRAY_LEN 36
@@ -1159,7 +1158,7 @@ static uint16_t count_valid_entries(
     uint16_t oldest = seq_current - n_back;
     uint32_t n_valid = 0;
 
-    for (int i = 0; i < ACCU_SEQ_COUNT; i++) {
+    for (int i = 0; i < CGM_SEQ_SLOTS; i++) {
         uint16_t seq_val = args->accu_seq[i];
         if (seq_val != 0 && seq_val <= seq_current && oldest < seq_val)
             n_valid++;
@@ -1215,9 +1214,9 @@ uint8_t f_check_cgm_trend(
             int idx = base_idx + i;
             if (idx < 0 || idx >= TREND_ARRAY_LEN) continue;
 
-            if (fun_comp_decimals(arrays[0][idx], thresholds[0], 10, 4))
+            if (fun_comp_decimals(arrays[0][idx], thresholds[0], 10, comp_modes[0]))
                 counter1++;
-            if (fun_comp_decimals(arrays[1][idx], thresholds[1], 10, 4))
+            if (fun_comp_decimals(arrays[1][idx], thresholds[1], 10, comp_modes[1]))
                 counter2++;
         }
 
