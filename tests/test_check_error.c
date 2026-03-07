@@ -997,6 +997,460 @@ static void test_err4_early_exit_preserves_flag(void)
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * err2 tests (rate-of-change)
+ * ════════════════════════════════════════════════════════════════════ */
+
+static void test_err2_initializes_debug_fields(void)
+{
+    TEST("err2: initializes all debug fields to defaults");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    /* Pre-set some fields to non-default values */
+    dbg->err2_delay_pre_condi[0] = 5;
+    dbg->err2_delay_pre_condi[1] = 5;
+    dbg->err2_delay_pre_condi[2] = 5;
+    dbg->err2_delay_condi[0] = 5;
+    dbg->err2_delay_condi[1] = 5;
+    dbg->err2_delay_condi[2] = 5;
+    dbg->err2_delay_flag = 5;
+    dbg->error_code2 = 5;
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* All pre_condi and condi bytes should be cleared */
+    ASSERT_EQ(dbg->err2_delay_pre_condi[0], 0);
+    ASSERT_EQ(dbg->err2_delay_pre_condi[1], 0);
+    ASSERT_EQ(dbg->err2_delay_pre_condi[2], 0);
+    ASSERT_EQ(dbg->err2_delay_condi[0], 0);
+    ASSERT_EQ(dbg->err2_delay_condi[1], 0);
+    ASSERT_EQ(dbg->err2_delay_condi[2], 0);
+    /* With all-zero args, delay_flag should be 0 */
+    ASSERT_EQ(dbg->err2_delay_flag, 0);
+    ASSERT_EQ(dbg->error_code2, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_low_seq_skips_computation(void)
+{
+    TEST("err2: idx <= err2_start_seq -> early skip, no computation");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    /* Set err2_start_seq high so idx is below it */
+    dev->err2_start_seq = 500;
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    args->idx = 5;  /* Below start_seq */
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* Should produce 0 error code */
+    ASSERT_EQ(dbg->error_code2, 0);
+    ASSERT_EQ(dbg->err2_delay_flag, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_buffer_rotation_flag_prev(void)
+{
+    TEST("err2: delay buffer rotates left by 1");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    /* Set recognizable pattern in flag_prev */
+    args->err2_delay_flag_prev[0] = 10;
+    args->err2_delay_flag_prev[1] = 20;
+    args->err2_delay_flag_prev[573] = 30;
+    args->err2_delay_flag_prev[574] = 40;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* After shift: [0]=old[1]=20, [572]=old[573]=30, [573]=old[574]=40 */
+    ASSERT_EQ(args->err2_delay_flag_prev[0], 20);
+    ASSERT_EQ(args->err2_delay_flag_prev[572], 30);
+    ASSERT_EQ(args->err2_delay_flag_prev[573], 40);
+    /* [574] should be new value (0 since no flag was set) */
+    ASSERT_EQ(args->err2_delay_flag_prev[574], 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_buffer_rotation_roc_prev(void)
+{
+    TEST("err2: roc delay buffer rotates left by 1");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    /* Set recognizable pattern in roc_prev */
+    args->err2_delay_roc_prev[0] = 1.0;
+    args->err2_delay_roc_prev[1] = 2.0;
+    args->err2_delay_roc_prev[574] = 99.0;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* After shift: [0]=old[1]=2.0 */
+    ASSERT_DOUBLE_EQ(args->err2_delay_roc_prev[0], 2.0);
+    /* [574] should be the new roc value (NaN for early-skip path) */
+    /* Since idx=0 <= err2_start_seq=0, it takes early path */
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_buffer_rotation_glucose_prev(void)
+{
+    TEST("err2: glucose delay buffer rotates left by 1");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    args->err2_delay_glucosevalue_prev[0] = 100.0;
+    args->err2_delay_glucosevalue_prev[1] = 200.0;
+    args->err2_delay_glucosevalue_prev[574] = 300.0;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* After shift: [0]=old[1]=200.0, [573]=old[574]=300.0 */
+    ASSERT_DOUBLE_EQ(args->err2_delay_glucosevalue_prev[0], 200.0);
+    ASSERT_DOUBLE_EQ(args->err2_delay_glucosevalue_prev[573], 300.0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_cummax_foretime_shifts(void)
+{
+    TEST("err2: cummax_foretime[100] shifts left by 1");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    /* Set recognizable pattern */
+    args->err2_cummax_foretime[0] = 10.0;
+    args->err2_cummax_foretime[1] = 20.0;
+    args->err2_cummax_foretime[98] = 30.0;
+    args->err2_cummax_foretime[99] = 40.0;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* After shift: [0]=old[1]=20.0, [97]=old[98]=30.0, [98]=old[99]=40.0 */
+    ASSERT_DOUBLE_EQ(args->err2_cummax_foretime[0], 20.0);
+    ASSERT_DOUBLE_EQ(args->err2_cummax_foretime[97], 30.0);
+    ASSERT_DOUBLE_EQ(args->err2_cummax_foretime[98], 40.0);
+    /* [99] should be NaN (new default) */
+    if (!isnan(args->err2_cummax_foretime[99])) {
+        FAIL("cummax_foretime[99] should be NaN");
+        free(args); free(dev); free(dbg);
+        return;
+    }
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_condi_prev_stored(void)
+{
+    TEST("err2: delay_condi_prev updated from delay_flag");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    /* Set initial condi_prev to non-zero */
+    args->err2_delay_condi_prev = 1;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* delay_condi_prev should be updated to the new delay_flag value */
+    ASSERT_EQ(args->err2_delay_condi_prev, dbg->err2_delay_flag);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_result_prev_stored(void)
+{
+    TEST("err2: result_prev updated from delay_flag");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    args->err2_result_prev = 1;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* result_prev should be updated */
+    ASSERT_EQ(args->err2_result_prev, dbg->err2_delay_flag);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_error_code_matches_delay_flag(void)
+{
+    TEST("err2: error_code2 matches delay_flag");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    ASSERT_EQ(dbg->error_code2, dbg->err2_delay_flag);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_all_zero_produces_zero(void)
+{
+    TEST("err2: all-zero inputs -> error_code2 = 0");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    check_error(args, dev, dbg, 50, 0.0);
+
+    ASSERT_EQ(dbg->error_code2, 0);
+    ASSERT_EQ(dbg->err2_delay_flag, 0);
+    ASSERT_EQ(dbg->err2_delay_condi[0], 0);
+    ASSERT_EQ(dbg->err2_delay_condi[1], 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_pre_condi_prev_stored(void)
+{
+    TEST("err2: pre_condi_prev updated from debug pre_condi");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    /* Set previous pre_condi to non-zero */
+    args->err2_delay_pre_condi_prev[0] = 1;
+    args->err2_delay_pre_condi_prev[1] = 1;
+    args->err2_delay_pre_condi_prev[2] = 1;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* pre_condi_prev should be updated from debug->pre_condi */
+    ASSERT_EQ(args->err2_delay_pre_condi_prev[0], dbg->err2_delay_pre_condi[0]);
+    ASSERT_EQ(args->err2_delay_pre_condi_prev[1], dbg->err2_delay_pre_condi[1]);
+    ASSERT_EQ(args->err2_delay_pre_condi_prev[2], dbg->err2_delay_pre_condi[2]);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_trimmed_mean_with_valid_data(void)
+{
+    TEST("err2: trimmed mean computed with sufficient valid data");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    /* Set up for trimmed mean computation:
+     * Need idx > err2_start_seq and seq2 > seq1 */
+    args->idx = 200;
+    dev->err2_start_seq = 10;
+    dev->err2_seq[0] = 5;   /* seq1 */
+    dev->err2_seq[1] = 10;
+    dev->err2_seq[2] = 50;  /* seq2 for threshold */
+
+    /* Set high thresholds so conditions don't fire */
+    dev->err2_glu = 999.0f;
+    dev->err2_cv[0] = 1.0f;   /* time divisor */
+    dev->err2_cv[1] = 999.0f; /* ROC threshold (high to avoid NaN path) */
+    dev->err2_cv[2] = 0.0f;   /* cummax factor */
+    dev->err2_alpha = 0.0f;   /* condition factor */
+    dev->err2_ycept = 999.0f; /* fun_comp_decimals threshold (high) */
+
+    /* Fill delay buffers with valid data and no flags */
+    for (int i = 0; i < 100; i++) {
+        args->err2_delay_flag_prev[i] = 0;  /* valid entries */
+        args->err2_delay_roc_prev[i] = 1.0 + (double)(i % 10);
+        args->err2_delay_slope_sharp_prev[i] = 2.0 + (double)(i % 5);
+        args->err2_delay_glucosevalue_prev[i] = 100.0 + (double)(i % 20);
+    }
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* With high thresholds, no conditions should fire */
+    ASSERT_EQ(dbg->error_code2, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_flagged_entries_excluded_from_trimmed_mean(void)
+{
+    TEST("err2: flagged delay entries excluded from trimmed mean");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    args->idx = 200;
+    dev->err2_start_seq = 10;
+    dev->err2_seq[0] = 0;
+    dev->err2_seq[2] = 50;
+
+    /* Flag all entries - should result in 0 valid count */
+    for (int i = 0; i < 575; i++) {
+        args->err2_delay_flag_prev[i] = 1;
+        args->err2_delay_roc_prev[i] = 5.0;
+    }
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* With all entries flagged, trimmed mean should remain NaN
+     * (or not be computed) */
+    /* error_code2 should be 0 */
+    ASSERT_EQ(dbg->error_code2, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_slope_prev_rotation(void)
+{
+    TEST("err2: slope delay buffer rotates correctly");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    args->err2_delay_slope_sharp_prev[0] = 10.0;
+    args->err2_delay_slope_sharp_prev[1] = 20.0;
+    args->err2_delay_slope_sharp_prev[2] = 30.0;
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* After rotation: [0]=old[1]=20.0, [1]=old[2]=30.0 */
+    ASSERT_DOUBLE_EQ(args->err2_delay_slope_sharp_prev[0], 20.0);
+    ASSERT_DOUBLE_EQ(args->err2_delay_slope_sharp_prev[1], 30.0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err2_cummax_nan_default(void)
+{
+    TEST("err2: cummax set to NaN by default");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    args->err2_cummax = 42.0;  /* Non-NaN initial */
+
+    check_error(args, dev, dbg, 100, 5.0);
+
+    /* After err2, cummax should be set to NaN (default) */
+    if (!isnan(args->err2_cummax)) {
+        FAIL("err2_cummax should be NaN");
+        free(args); free(dev); free(dbg);
+        return;
+    }
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * Epilogue tests
  * ════════════════════════════════════════════════════════════════════ */
 
@@ -1111,6 +1565,23 @@ int main(void)
     test_err4_range_computed_for_seq_gte_2();
     test_err4_nan_in_prev_min();
     test_err4_early_exit_preserves_flag();
+
+    printf("\nerr2 (rate-of-change):\n");
+    test_err2_initializes_debug_fields();
+    test_err2_low_seq_skips_computation();
+    test_err2_buffer_rotation_flag_prev();
+    test_err2_buffer_rotation_roc_prev();
+    test_err2_buffer_rotation_glucose_prev();
+    test_err2_cummax_foretime_shifts();
+    test_err2_condi_prev_stored();
+    test_err2_result_prev_stored();
+    test_err2_error_code_matches_delay_flag();
+    test_err2_all_zero_produces_zero();
+    test_err2_pre_condi_prev_stored();
+    test_err2_trimmed_mean_with_valid_data();
+    test_err2_flagged_entries_excluded_from_trimmed_mean();
+    test_err2_slope_prev_rotation();
+    test_err2_cummax_nan_default();
 
     printf("\nEpilogue:\n");
     test_err_delay_arr_shift();

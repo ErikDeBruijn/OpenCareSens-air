@@ -553,8 +553,36 @@ static void check_err1(
 /* ────────────────────────────────────────────────────────────────────
  * err2: Rate-of-change detector
  *
- * From check_error.asm ~line 5200 through ~line 5700.
- * Detects unrealistic rates of glucose change.
+ * From check_error.asm lines ~3870-5515 (address 0x6952e-0x6a924).
+ * ~900 instructions, fourth detector in pipeline.
+ *
+ * Detects unrealistic rates of glucose change using 575-element
+ * delay buffers, trimmed means, cumulative maximums, and multiple
+ * condition evaluation.
+ *
+ * Algorithm phases:
+ *   1. Initialize debug outputs
+ *   2. Compute rate-of-change (ROC) and slope from signal history
+ *   3. Build working buffers and compute trimmed means for ROC,
+ *      slope, and glucose metrics
+ *   4. Compute cumulative maximums and evaluate conditions
+ *   5. Evaluate final flag and conditions (delay_condi, delay_flag)
+ *   6. Compute cummax foretime and final err2 conditions
+ *   7. Buffer rotation (shift 575-element arrays left by 1)
+ *   8. Store results (error_code2, update prev state)
+ *
+ * Binary register mapping:
+ *   r6 / sp+0x148 = debug pointer
+ *   sp+0x14c      = args pointer
+ *   sp+0xf4       = dev_info pointer
+ *   sp+0x18c      = seq_current (lr in some phases)
+ *   sp+0xa4       = pointer to args->err2_delay_condi_prev
+ *   sp+0xd4       = pointer to args->err2_delay_pre_condi_prev area
+ *   sp+0xa8       = pointer to debug->err2_delay_roc area (r10)
+ *   r9            = stack buffer for working data
+ *   d15           = time divisor (from dev_info)
+ *   d8, d9, d11   = ROC, slope, glucose values
+ *   d10, d12, d13 = cummax / threshold intermediates
  * ──────────────────────────────────────────────────────────────────── */
 static void check_err2(
     struct air1_opcal4_arguments_t *args,
@@ -563,9 +591,825 @@ static void check_err2(
     uint16_t seq_current,
     double glucose_value)
 {
-    /* TODO: Implement err2 detector (rate-of-change) */
-    (void)args; (void)dev_info; (void)debug;
-    (void)seq_current; (void)glucose_value;
+    (void)seq_current;  /* seq_val computed from args->idx */
+
+    /*
+     * Binary ref: lines 3870-3903 (0x6952e-0x695a4)
+     * STAGE 1: Initialize debug output fields
+     *
+     * The binary initializes:
+     *   - High words of debug doubles to NaN pattern (0x7ff80000)
+     *   - Low words to 0
+     * For bytes, stores 0.
+     *
+     * debug+0x808..0x84c covers err2_delay_roc through err2_delay_glu_trimmed_mean
+     * plus err2_delay_pre_condi, err2_delay_condi, err2_delay_flag, err2_cummax
+     *
+     * Lines 3881-3889: stores NaN high word (0x7ff8xxxx) to debug+0x80c,
+     *   0x814, 0x81c, 0x824, 0x82c, 0x834, 0x83c, 0x844, 0x84c, 0x85c
+     * Lines 3894-3903: stores 0 to debug+0x808, 0x810, 0x818, 0x820,
+     *   0x828, 0x830, 0x838, 0x840, 0x848, 0x858
+     *
+     * In our struct, these correspond to the err2 debug fields.
+     * We initialize all err2 debug outputs to safe defaults.
+     */
+    debug->err2_delay_revised_value = NAN;
+    debug->err2_delay_roc = NAN;
+    debug->err2_delay_slope_sharp = NAN;
+    debug->err2_delay_roc_cummax = NAN;
+    debug->err2_delay_roc_trimmed_mean = NAN;
+    debug->err2_delay_slope_cummax = NAN;
+    debug->err2_delay_slope_trimmed_mean = NAN;
+    debug->err2_delay_glu_cummax = NAN;
+    debug->err2_delay_glu_trimmed_mean = NAN;
+    debug->err2_delay_pre_condi[0] = 0;
+    debug->err2_delay_pre_condi[1] = 0;
+    debug->err2_delay_pre_condi[2] = 0;
+    debug->err2_delay_condi[0] = 0;
+    debug->err2_delay_condi[1] = 0;
+    debug->err2_delay_condi[2] = 0;
+    debug->err2_delay_flag = 0;
+    debug->err2_cummax = NAN;
+    debug->err2_crt_current[0] = 0;
+    debug->err2_crt_current[1] = 0;
+    debug->err2_crt_glu[0] = 0;
+    debug->err2_crt_glu[1] = 0;
+    debug->err2_crt_cv = NAN;
+    debug->err2_condi[0] = 0;
+    debug->err2_condi[1] = 0;
+    debug->error_code2 = 0;
+
+    /*
+     * Binary ref: lines 3904-3912 (0x695a4-0x695c0)
+     * STAGE 2: Load sequence from args and check against dev_info threshold
+     *
+     * r4 = args->idx (signed, loaded from args+0x648 at 0x695a4)
+     * lr = (uint16_t)r4 (seq for this context, stored at sp+0x18c)
+     * r0 = dev_info->err2_start_seq (dev_info+0x502)
+     * r11 = (int16_t)r0
+     *
+     * If r4 <= r11: skip main computation, branch to 0x69614
+     */
+    int16_t seq_idx = (int16_t)args->idx;  /* TODO: Verify mapping with oracle */
+    uint16_t seq_val = (uint16_t)seq_idx;
+
+    uint16_t err2_start = dev_info->err2_start_seq;
+
+    if (seq_idx <= (int16_t)err2_start) {
+        /*
+         * Binary ref: lines 3939-3945 (0x69614-0x69628)
+         * Early path: seq below threshold. Jump to main loop at 0x6996e
+         * with d11=0.0 (glucose_value placeholder), d8/d9 uninitialized
+         * but will be set in the main convergence point.
+         *
+         * This skips the ROC computation and goes directly to the
+         * trimmed mean / buffer rotation phase.
+         */
+        goto phase_trimmed_mean;
+    }
+
+    /*
+     * Binary ref: lines 3913-3938 (0x695c2-0x69612)
+     * STAGE 3: Iterate through glucose/ROC buffer
+     *
+     * Computes ROC values from the glucose value buffer and stores
+     * them into a working buffer on the stack (r9).
+     *
+     * The loop at 0x695e4 iterates through glucose values stored in
+     * the args struct (at args+0x4bf0 area, which is within
+     * err2_delay_glucosevalue_prev), comparing against a threshold
+     * from dev_info+0x550 (err2_cv area).
+     *
+     * Values >= threshold are stored to the working buffer; values
+     * below are stored as {0, NaN}.
+     *
+     * r8 counts valid entries; r4 counts valid entries with good values.
+     *
+     * After the loop completes or if condition met, falls through to
+     * 0x6962a (ROC computation).
+     */
+
+    /*
+     * Binary ref: lines 3946-3968 (0x6962a-0x69692)
+     * STAGE 4: Compute rate of change (ROC) and slope
+     *
+     * At 0x6962a:
+     *   r0 = dev_info (from sp+0xf4)
+     *   r2 = 0x11f (= 287)
+     *   r3 = debug (from sp+0x148)
+     *   r10 = (uint8_t)r8
+     *
+     * Load dev_info+0x500 (err2_start_seq), compute index:
+     *   r2 = 0x11f - dev_info->err2_start_seq
+     *   Load float from args[r2] area (at offset 0x1c8 from lr)
+     *   Convert to double -> d16
+     *
+     * Load float from debug+0x4 area -> d10
+     *   d16 = d10 - d16 (signal difference)
+     *   d16 = d16 / d15 (divide by time base)
+     *
+     * Compare d16 against dev_info+0x508 threshold (d17)
+     *   If d16 > d17: d8 = NaN (set from literal pool)
+     *   Else: compute slope from buffer entries
+     *
+     * The ROC is the change in glucose divided by the time base.
+     * The slope is computed from a pair of working buffer entries.
+     *
+     * Store d8 (slope) to debug+0x808 -> debug->err2_delay_slope_sharp
+     *
+     * TODO: Verify mapping of args float array offsets and dev_info+0x508
+     */
+    {
+        /* Compute ROC from signal difference divided by time base */
+        uint16_t start = dev_info->err2_start_seq;
+        uint16_t buf_idx = (uint16_t)(287 - start);
+
+        /* Load time divisor from dev_info err2_cv area */
+        /* TODO: Verify mapping — dev_info+0x508 is 6 bytes past err2_seq[3] */
+        double time_div = (double)dev_info->err2_cv[0];
+        if (time_div == 0.0) time_div = 1.0;  /* Guard against div-by-zero */
+
+        /* The signal difference comes from glucose buffer values */
+        double sig_current = glucose_value;
+        double sig_prev = 0.0;
+        if (buf_idx < 575) {
+            sig_prev = args->err2_delay_glucosevalue_prev[buf_idx];
+        }
+        double roc = (sig_current - sig_prev) / time_div;
+
+        /* Check against threshold */
+        double roc_thresh = (double)dev_info->err2_cv[1];  /* TODO: Verify mapping with oracle */
+        double d8_slope;  /* slope_sharp */
+        double d9_roc;    /* roc */
+        double d11_glu;   /* glucose value for delay */
+
+        if (roc > roc_thresh) {
+            d8_slope = NAN;
+            d9_roc = NAN;
+            d11_glu = glucose_value;
+        } else {
+            /*
+             * Binary ref: lines 3966-3976 (0x69670-0x69696)
+             * Compute slope from adjacent buffer entries:
+             *   r0 = r10 - 1
+             *   d17 = working_buf[r0]
+             *   d18 = working_buf[r0 - start]
+             *   d17 = d17 - d18
+             *   d8 = d17 / d16  (slope = value_diff / roc)
+             *
+             * Then store d8 to debug+0x808
+             */
+            d9_roc = roc;
+            d11_glu = glucose_value;
+
+            /* Simplified slope computation */
+            /* TODO: Verify exact buffer index computation with oracle */
+            if (seq_val > 0 && seq_val > start) {
+                uint16_t idx_a = seq_val - 1;
+                uint16_t idx_b = idx_a - start;
+                double val_a = 0.0, val_b = 0.0;
+                if (idx_a < 575)
+                    val_a = args->err2_delay_glucosevalue_prev[idx_a];
+                if (idx_b < 575)
+                    val_b = args->err2_delay_glucosevalue_prev[idx_b];
+                double val_diff = val_a - val_b;
+                if (roc != 0.0)
+                    d8_slope = val_diff / roc;
+                else
+                    d8_slope = NAN;
+            } else {
+                d8_slope = NAN;
+            }
+        }
+
+        /*
+         * Binary ref: lines 3976-4040 (0x69696-0x6976c)
+         * STAGE 5: Fill working buffer and run regression
+         *
+         * Build integer sequence 1..r10 in working buffer.
+         * Clear a second buffer to zero.
+         *
+         * Compute d11 * 0.5, round it, compare against r4 (uint8_t).
+         * If rounded(d11 * 0.5) >= 0 (bpl): skip regression, go to 0x69790
+         * Else:
+         *   Call fit_simple_regression with the working buffers
+         *   Store slope to debug+0x810 (err2_delay_roc)
+         *   d8 = result from debug+0x808 (err2_delay_slope_sharp)
+         *
+         * At 0x69790-0x6979e: restore pointers, branch to convergence.
+         *
+         * Convergence at 0x6979e:
+         *   Load d11 from working_buf[r10-1] (glucose from r9 buffer)
+         *
+         * Then check lr (err2_delay_condi_prev):
+         *   If lr == 1: take absolute values of d9, d8
+         *   Else if prev_condi_prev == 1: load d8,d9,d0 from
+         *     pre_condi_prev area
+         *   Else: compute abs + fmax for d8, d9
+         *
+         * The key outputs stored are:
+         *   debug->err2_delay_roc = d9
+         *   debug->err2_delay_slope_sharp = d8
+         *   debug->err2_delay_revised_value = d0 (glucose)
+         *
+         * Then at 0x69954-0x6996a:
+         *   Store d0 to debug+0x840 (err2_delay_glu_cummax area)
+         *   Store d9 to debug+0x830 (err2_delay_slope_cummax area)
+         *   Store d8 to debug+0x820 (err2_delay_roc_cummax area)
+         */
+
+        /*
+         * Check condition: previous delay condition
+         * Binary at 0x697a2: cmp lr, #1 (lr = err2_delay_condi_prev value)
+         */
+        uint8_t condi_prev = args->err2_delay_condi_prev;
+
+        if (condi_prev == 1) {
+            /* Take absolute values */
+            if (d9_roc < 0.0) d9_roc = -d9_roc;
+            if (d8_slope < 0.0) d8_slope = -d8_slope;
+        } else {
+            /*
+             * Binary ref: lines 4070-4079 (0x697da-0x697f4)
+             * Check args->err2_delay_pre_condi_prev[0]
+             * If == 1: load d8, d9, d0 from pre_condi_prev data area
+             *   (args->err2_delay_roc_cummax_prev etc.)
+             *
+             * Otherwise (0x698ca): compute abs values with fmax against
+             * cummax prev values, calling fmax (blx r4 at 0x698fa etc.)
+             */
+            uint8_t pre_condi_0 = args->err2_delay_pre_condi_prev[0];
+            if (pre_condi_0 == 1) {
+                /* Load cached values from previous state */
+                d8_slope = args->err2_delay_roc_cummax_prev;
+                d9_roc = args->err2_delay_slope_cummax_prev;
+                d11_glu = args->err2_delay_glu_cummax_prev;
+                /* TODO: Verify mapping — disasm loads from sp+0xd4 + offsets */
+            } else {
+                /*
+                 * Binary ref: lines 4147-4194 (0x698ca-0x6996a)
+                 * Compute absolute values and fmax against previous cummaxes
+                 *
+                 * |d8| = abs(d8_slope)
+                 * call fmax(|d8|, prev_roc_cummax) -> d8
+                 *
+                 * |d9| = abs(d9_roc)
+                 * call fmax(|d9|, prev_slope_cummax) -> d9
+                 *
+                 * call fmax(d11_glu, prev_glu_cummax) -> d0
+                 *
+                 * Then store to debug fields at 0x69954-0x6996a.
+                 */
+                double abs_slope = fabs(d8_slope);
+                double abs_roc = fabs(d9_roc);
+
+                /* Cummax: max of current absolute value and previous cummax */
+                double prev_roc_cm = args->err2_delay_roc_cummax_prev;
+                double prev_slope_cm = args->err2_delay_slope_cummax_prev;
+                double prev_glu_cm = args->err2_delay_glu_cummax_prev;
+
+                d8_slope = fmax(abs_slope, prev_roc_cm);
+                d9_roc = fmax(abs_roc, prev_slope_cm);
+                d11_glu = fmax(glucose_value, prev_glu_cm);
+            }
+        }
+
+        /* Store ROC values to debug */
+        debug->err2_delay_revised_value = d11_glu;
+        debug->err2_delay_slope_sharp = d9_roc;
+        debug->err2_delay_roc = d8_slope;
+
+        /*
+         * Binary ref: lines 4189-4194 (0x69954-0x6996a)
+         * Store cummax-related values:
+         *   debug+0x840 = d0 (glu cummax)
+         *   debug+0x830 = d9 (slope cummax)
+         *   debug+0x820 = d8 (roc cummax)
+         */
+        debug->err2_delay_roc_cummax = d8_slope;
+        debug->err2_delay_slope_cummax = d9_roc;
+        debug->err2_delay_glu_cummax = d11_glu;
+    }
+
+phase_trimmed_mean:
+    /*
+     * Binary ref: lines 4195-4200 (0x6996e-0x6997e)
+     * STAGE 6: Check sequence against dev_info threshold
+     *
+     * Load dev_info+0x506 (err2_seq[2]) as r5/r11.
+     * Compare signed lr (seq) against signed r11.
+     * If seq <= r11: skip to 0x69eb4 (buffer rotation).
+     */
+    ;
+    {
+        uint16_t err2_seq2 = dev_info->err2_seq[2];
+        int16_t signed_seq = (int16_t)seq_val;
+        int16_t signed_th = (int16_t)err2_seq2;
+
+        if (signed_seq <= signed_th) {
+            goto phase_buffer_rotation;
+        }
+    }
+
+    /*
+     * Binary ref: lines 4201-4232 (0x69982-0x699e2)
+     * STAGE 7: Clear working buffer, prepare for trimmed mean #1 (ROC)
+     *
+     * Clear 0x11f8 bytes on stack (the working buffer).
+     * Load args->err2_delay_flag_prev offset and args->err2_delay_roc_prev offset.
+     * Compute loop bounds from dev_info->err2_seq[1] and err2_seq[2].
+     *
+     * Loop from i=0 to (err2_seq2 - err2_seq1):
+     *   If err2_delay_flag_prev[i] != 0: skip (only count unflagged entries)
+     *   Else: load err2_delay_roc_prev[i], compute |value|, store to buffer
+     *   Increment valid count
+     *
+     * After loop: check if err2_seq2 * 0.5 > valid_count
+     *   If so: skip trimmed mean (not enough data)
+     *   Else: call f_trimmed_mean(buffer, count, 5)
+     *   Store result to debug+0x828 (err2_delay_roc_trimmed_mean)
+     */
+    {
+        uint16_t seq1 = dev_info->err2_seq[0];  /* TODO: Verify mapping with oracle */
+        uint16_t seq2 = dev_info->err2_seq[2];
+        int range = (int)seq2 - (int)seq1;
+
+        /* --- Trimmed mean #1: ROC values --- */
+        double work_buf[575];
+        uint16_t valid_count = 0;
+
+        for (int i = 0; i <= range && i < 575; i++) {
+            if (args->err2_delay_flag_prev[i] != 0)
+                continue;
+            double val = args->err2_delay_roc_prev[i];
+            /* Compute absolute value */
+            if (val < 0.0) val = -val;
+            if (valid_count < 575) {
+                work_buf[valid_count] = val;
+                valid_count++;
+            }
+        }
+
+        /* Check data sufficiency: seq2 * 0.5 must be <= valid_count */
+        double half_seq = (double)seq2 * 0.5;
+        double half_rounded = math_round(half_seq);
+        if (half_rounded <= (double)valid_count && valid_count > 0) {
+            debug->err2_delay_roc_trimmed_mean =
+                f_trimmed_mean(work_buf, valid_count, 5);
+        }
+
+        /*
+         * Binary ref: lines 4255-4299 (0x69a30-0x69abe)
+         * STAGE 8: Trimmed mean #2 (slope)
+         *
+         * Same pattern: iterate delay_flag_prev, load delay_slope_sharp_prev,
+         * compute abs, collect into buffer, then f_trimmed_mean.
+         * Store result to debug+0x838 (err2_delay_slope_trimmed_mean).
+         */
+        valid_count = 0;
+        for (int i = 0; i <= range && i < 575; i++) {
+            if (args->err2_delay_flag_prev[i] != 0)
+                continue;
+            double val = args->err2_delay_slope_sharp_prev[i];
+            if (val < 0.0) val = -val;
+            if (valid_count < 575) {
+                work_buf[valid_count] = val;
+                valid_count++;
+            }
+        }
+
+        half_seq = (double)seq2 * 0.5;
+        if (math_round(half_seq) <= (double)valid_count && valid_count > 0) {
+            debug->err2_delay_slope_trimmed_mean =
+                f_trimmed_mean(work_buf, valid_count, 5);
+        }
+
+        /*
+         * Binary ref: lines 4303-4350 (0x69aca-0x69b62)
+         * STAGE 9: Trimmed mean #3 (glucose)
+         *
+         * Same pattern with delay_glucosevalue_prev.
+         * Store result to debug+0x848 (err2_delay_glu_trimmed_mean).
+         *
+         * After this, check if seq2 * 0.5 > count (using d9 from prev count):
+         *   If so: skip to buffer rotation (0x69eb4).
+         */
+        valid_count = 0;
+        for (int i = 0; i <= range && i < 575; i++) {
+            if (args->err2_delay_flag_prev[i] != 0)
+                continue;
+            double val = args->err2_delay_glucosevalue_prev[i];
+            if (val < 0.0) val = -val;
+            if (valid_count < 575) {
+                work_buf[valid_count] = val;
+                valid_count++;
+            }
+        }
+
+        double glu_half = (double)seq2 * 0.5;
+        double glu_count_d = (double)valid_count;
+        if (math_round(glu_half) > glu_count_d) {
+            goto phase_buffer_rotation;
+        }
+        if (valid_count > 0) {
+            debug->err2_delay_glu_trimmed_mean =
+                f_trimmed_mean(work_buf, valid_count, 5);
+        }
+
+        /*
+         * Binary ref: lines 4355-4422 (0x69b72-0x69c5e)
+         * STAGE 10: Cummax computation and condition evaluation
+         *
+         * Build pairs for cummax:
+         *   pair1 = (roc_trimmed * dev_info->err2_cv[2], roc_cummax)
+         *     -> call fmax -> new roc cummax
+         *   pair2 = (slope_trimmed * dev_info->err2_cv[3], slope_cummax)
+         *     -> call fmax -> new slope cummax
+         *   pair3 = (glu_trimmed * dev_info->err2_cv[4], glu_cummax)
+         *     -> call fmax -> new glu cummax
+         *
+         * The binary loads factors from dev_info+0x518, +0x528, +0x540
+         * which correspond to threshold fields.
+         *
+         * After cummax update, evaluate conditions:
+         *
+         * At 0x69c42: Check if d8 (debug+0x808 = slope_sharp value) is NaN
+         *   If NaN: branch to NaN handler at 0x6c5da
+         *
+         * At 0x69c4e: d17 = roc_cummax * d13 (factor from dev_info)
+         *   Compare d16 (slope value) >= d17
+         *   If so: set debug->err2_delay_pre_condi[0] = 1 (debug+0x860)
+         *
+         * At 0x69c60: Compare d11 (glucose) > dev_info+0x550 threshold
+         *   If so AND prev condition: set debug+0x860 = 1
+         *
+         * TODO: Verify factor field mappings (dev_info+0x518, 0x528, 0x540)
+         */
+        double roc_tm = debug->err2_delay_roc_trimmed_mean;
+        double slope_tm = debug->err2_delay_slope_trimmed_mean;
+        double glu_tm = debug->err2_delay_glu_trimmed_mean;
+
+        /* Load cummax factors from dev_info */
+        /* dev_info+0x518 area -> near err2_cv[2] */
+        /* TODO: Verify mapping with oracle */
+        double roc_factor = (double)dev_info->err2_cv[2];
+        double slope_factor = roc_factor;  /* TODO: Verify separate factor */
+
+        /* Compute cummax pairs using fmax */
+        double roc_cm_new = isnan(roc_tm) ? debug->err2_delay_roc_cummax :
+            fmax(roc_tm * roc_factor, debug->err2_delay_roc_cummax);
+        double slope_cm_new = isnan(slope_tm) ? debug->err2_delay_slope_cummax :
+            fmax(slope_tm * slope_factor, debug->err2_delay_slope_cummax);
+        double glu_cm_new = isnan(glu_tm) ? debug->err2_delay_glu_cummax :
+            fmax(glu_tm, debug->err2_delay_glu_cummax);
+
+        debug->err2_delay_roc_cummax = roc_cm_new;
+        debug->err2_delay_slope_cummax = slope_cm_new;
+        debug->err2_delay_glu_cummax = glu_cm_new;
+
+        /*
+         * Binary ref: lines 4415-4432 (0x69c42-0x69c7c)
+         * STAGE 11: Pre-condition evaluation
+         *
+         * Check debug+0x808 (err2_delay_slope_sharp / d8) for NaN.
+         *   If NaN -> handler sets condition and branches back
+         *
+         * d17 = roc_cummax * d13 (factor)
+         * If d16 (slope) >= d17: set err2_delay_pre_condi[0] = 1
+         *
+         * Also: check d11 (glucose) > dev_info+0x550 (err2_glu threshold)
+         *   If both conditions true: set err2_delay_pre_condi[0] = 1
+         */
+        double slope_val = debug->err2_delay_slope_sharp;
+        double glu_val = debug->err2_delay_revised_value;
+
+        if (!isnan(slope_val)) {
+            double roc_cm = debug->err2_delay_roc_cummax;
+            /* TODO: Verify factor from dev_info */
+            double factor = (double)dev_info->err2_alpha;  /* TODO: Verify mapping with oracle */
+            double thresh = roc_cm * factor;
+
+            if (slope_val >= thresh) {
+                /* Also check glucose against threshold */
+                double glu_thresh = (double)dev_info->err2_glu;
+                if (glu_val > glu_thresh) {
+                    debug->err2_delay_pre_condi[0] = 1;
+                }
+            }
+        }
+
+        /*
+         * Binary ref: lines 4432-4444 (0x69c7c-0x69ca8)
+         * STAGE 12: Pre-condition[1] (slope cummax check)
+         *
+         * Load debug+0x810 (err2_delay_roc = d8 in binary context)
+         * Check for NaN -> handler
+         * d16 = slope_cummax_new * d15 (another factor)
+         * If d8 >= d16: set err2_delay_pre_condi[1] = 1
+         */
+        double roc_val = debug->err2_delay_roc;
+        if (!isnan(roc_val)) {
+            double slope_cm = debug->err2_delay_slope_cummax;
+            /* TODO: Verify factor mapping with oracle */
+            double factor2 = (double)dev_info->err2_alpha;  /* TODO: Verify */
+            double thresh2 = slope_cm * factor2;
+
+            if (roc_val >= thresh2) {
+                debug->err2_delay_pre_condi[1] = 1;
+            }
+        }
+
+        /*
+         * Binary ref: lines 4445-4457 (0x69ca8-0x69cce)
+         * STAGE 13: Pre-condition[2] via fun_comp_decimals
+         *
+         * Load dev_info+0x538 threshold (err2_ycept area)
+         * Call fun_comp_decimals(d8, threshold, 10, 3) -> mode 3 = ge
+         * If result != 0: set err2_delay_pre_condi[2] = 1
+         */
+        {
+            double thresh_val = (double)dev_info->err2_ycept;  /* TODO: Verify mapping with oracle */
+            if (!isnan(roc_val)) {
+                uint8_t cmp_result = fun_comp_decimals(roc_val, thresh_val, 10, 3);
+                if (cmp_result != 0) {
+                    debug->err2_delay_pre_condi[2] = 1;
+                }
+            }
+        }
+
+        /*
+         * Binary ref: lines 4458-4492 (0x69cd0-0x69d2c)
+         * STAGE 14: Previous condition override
+         *
+         * If seq >= 2 AND delay_pre_condi_prev[i] == 1:
+         *   Check sign of d8 (roc_val):
+         *   If d8 >= 0: force err2_delay_pre_condi[i] = 1
+         *   Else: force err2_delay_pre_condi[i] = 0
+         *
+         * This is done for all 3 pre_condi indices.
+         */
+        if (seq_val >= 2) {
+            for (int i = 0; i < 3; i++) {
+                if (args->err2_delay_pre_condi_prev[i] == 1) {
+                    if (!isnan(roc_val) && roc_val >= 0.0) {
+                        debug->err2_delay_pre_condi[i] = 1;
+                    } else {
+                        debug->err2_delay_pre_condi[i] = 0;
+                    }
+                }
+            }
+        }
+
+        /*
+         * Binary ref: lines 4493-4536 (0x69d30-0x69dac)
+         * STAGE 15: Combine conditions into delay_condi and delay_flag
+         *
+         * debug->err2_delay_condi[0]:
+         *   If pre_condi[0] == 1 AND pre_condi[2] == 1: condi[0] = 1
+         *   Store at debug+0x7fd
+         *
+         * debug->err2_delay_condi[1]:
+         *   If pre_condi[1] == 1 AND pre_condi[2] == 1: condi[1] = 1
+         *   Store at debug+0x7fe
+         *
+         * Compute delay_flag (debug+0x7ff):
+         *   If d12 (glu cummax) is not NaN:
+         *     d16 = d9 (slope_cummax) * d16 (factor from sp+0x180)
+         *     If d11 (glucose) >= d16: delay_flag = 1
+         *   Else: delay_flag from existing
+         *
+         * Then combine:
+         *   If condi[0] AND delay_flag: set debug->err2_delay_flag = 1
+         *   Else if condi[1] AND delay_flag: set debug->err2_delay_flag = 1
+         */
+        uint8_t pre0 = debug->err2_delay_pre_condi[0];
+        uint8_t pre1 = debug->err2_delay_pre_condi[1];
+        uint8_t pre2 = debug->err2_delay_pre_condi[2];
+
+        if (pre0 == 1 && pre2 == 1)
+            debug->err2_delay_condi[0] = 1;
+        if (pre1 == 1 && pre2 == 1)
+            debug->err2_delay_condi[1] = 1;
+
+        /*
+         * Delay flag computation from cummax check
+         * Binary ref: lines 4512-4536 (0x69d60-0x69dac)
+         *
+         * Check d12 (glu cummax) for NaN. If NaN: skip.
+         * d16 = d9 * factor (slope_trimmed * threshold)
+         * If glucose >= d16: delay_flag_val = 1
+         *
+         * Then final: if (condi[0] && delay_flag) || (condi[1] && delay_flag):
+         *   set debug->err2_delay_flag = 1
+         */
+        uint8_t delay_flag_val = 0;
+
+        if (!isnan(debug->err2_delay_glu_cummax)) {
+            /* TODO: Verify factor from dev_info */
+            double slope_cm = debug->err2_delay_slope_cummax;
+            /* TODO: Verify factor source (dev_info+0x528+8 area) */
+            double glu_factor = (double)dev_info->err2_alpha;  /* TODO: Verify mapping with oracle */
+            double glu_thresh_val = slope_cm * glu_factor;
+
+            if (glu_val >= glu_thresh_val) {
+                delay_flag_val = 1;
+            }
+        }
+
+        /* Store delay_flag_val to debug->err2_delay_condi[2] area */
+        debug->err2_delay_condi[2] = delay_flag_val;
+
+        /* Final flag: combine condi[0|1] with delay_flag_val */
+        uint8_t condi0 = debug->err2_delay_condi[0];
+        uint8_t condi1 = debug->err2_delay_condi[1];
+        uint8_t condi2 = debug->err2_delay_condi[2];
+
+        if ((condi0 == 1 && condi2 == 1) || (condi1 == 1 && condi2 == 1)) {
+            debug->err2_delay_flag = 1;
+        }
+    }
+
+    /*
+     * Binary ref: lines 4537-4549 (0x69dac-0x69dd4)
+     * STAGE 16: Revised value update
+     *
+     * If delay_condi_prev != 0:
+     *   Load revised_value from args->err2_delay_revised_value_prev
+     *   If not NaN: use it as d11 (glucose)
+     *   Store to debug+0x818 (err2_delay_revised_value)
+     *
+     * Else (delay_condi_prev == 0):
+     *   Store d11 to debug+0x818
+     *   Then load previous cummax values from args and store to debug
+     */
+    {
+        uint8_t condi_prev_flag = args->err2_delay_condi_prev;
+
+        if (condi_prev_flag != 0) {
+            double prev_revised = args->err2_delay_revised_value_prev;
+            if (!isnan(prev_revised)) {
+                debug->err2_delay_revised_value = prev_revised;
+            }
+            /* Also update cummax values from prev state */
+            /* debug->err2_delay_roc_cummax already set above */
+        } else {
+            /* Store current glucose to revised value */
+            debug->err2_delay_revised_value = glucose_value;
+            /* Load prev cummax values into debug */
+            debug->err2_delay_roc_cummax = args->err2_delay_roc_cummax_prev;
+            debug->err2_delay_slope_cummax = args->err2_delay_slope_cummax_prev;
+            debug->err2_delay_glu_cummax = args->err2_delay_glu_cummax_prev;
+        }
+    }
+
+phase_buffer_rotation:
+    /*
+     * Binary ref: lines 4630-4660 (0x69eb4-0x69f18)
+     * STAGE 17: Buffer rotation for 575-element delay arrays
+     *
+     * Three arrays are shifted left by 1 element:
+     *   1. err2_delay_flag_prev[575] (bytes)
+     *   2. err2_delay_roc_prev[575] (doubles)
+     *   3. err2_delay_slope_sharp_prev[575] (doubles)
+     *
+     * Binary pattern for each (lines 4631-4654):
+     *   r0 = args + flag_offset + 0x611b (for flag_prev)
+     *   r1 = args + roc_offset + 0x6360 (for roc_prev)
+     *   r2 = args + slope_offset + 0x8758 (for slope_prev)
+     *   r3 = 0xfffffdc2 = -574 (loop counter)
+     *
+     *   Loop while r3 != 0:
+     *     flag_prev[r3 + 0x23e] -> flag_prev[r3 + 0x23d]  (shift left by 1)
+     *     roc_prev[r1+8] -> roc_prev[r1]                   (shift left by 1)
+     *     slope_prev gets similar treatment
+     *     r3++
+     *
+     * After rotation, store current values at end:
+     *   flag_prev[574] = debug->err2_delay_flag
+     *   roc_prev[574] = debug->err2_delay_roc (from debug+0x808)
+     *   slope_prev[574] = debug->err2_delay_slope_sharp
+     *   glucosevalue_prev[574] = debug->err2_delay_revised_value
+     *
+     * Also store pre_condi values and revised_value to args prev arrays.
+     */
+    memmove(args->err2_delay_flag_prev,
+            args->err2_delay_flag_prev + 1,
+            574 * sizeof(uint8_t));
+    args->err2_delay_flag_prev[574] = debug->err2_delay_flag;
+
+    memmove(args->err2_delay_roc_prev,
+            args->err2_delay_roc_prev + 1,
+            574 * sizeof(double));
+    args->err2_delay_roc_prev[574] = debug->err2_delay_roc;
+
+    memmove(args->err2_delay_slope_sharp_prev,
+            args->err2_delay_slope_sharp_prev + 1,
+            574 * sizeof(double));
+    args->err2_delay_slope_sharp_prev[574] = debug->err2_delay_slope_sharp;
+
+    /* Also rotate glucose value delay array */
+    memmove(args->err2_delay_glucosevalue_prev,
+            args->err2_delay_glucosevalue_prev + 1,
+            574 * sizeof(double));
+    args->err2_delay_glucosevalue_prev[574] = debug->err2_delay_revised_value;
+
+    /*
+     * Binary ref: lines 4661-4699 (0x69f18-0x69f9e)
+     * STAGE 18: Store results to args prev state
+     *
+     * Copy debug->err2_delay_flag to args->err2_delay_condi_prev
+     * Copy debug->err2_delay_roc to args roc prev
+     * Copy debug->err2_delay_slope_sharp to args slope prev
+     *
+     * Store cummax values:
+     *   args->err2_delay_roc_cummax_prev = debug->err2_delay_roc_cummax
+     *     (but check against threshold: if < dev_info+0x550, set to NaN)
+     *   args->err2_delay_slope_cummax_prev = debug->err2_delay_slope_cummax
+     *   args->err2_delay_glu_cummax_prev = debug->err2_delay_glu_cummax
+     *
+     * Copy pre_condi[0..2] to args->err2_delay_pre_condi_prev[0..2]
+     * Copy revised_value to args->err2_delay_revised_value_prev
+     */
+    args->err2_delay_condi_prev = debug->err2_delay_flag;
+
+    /* Store cummax values to args prev, with threshold check */
+    {
+        double roc_cm = debug->err2_delay_roc_cummax;
+        double glu_thresh = (double)dev_info->err2_glu;  /* TODO: Verify mapping with oracle */
+
+        /*
+         * Binary ref: 0x69f4e-0x69f64
+         * Compare err2_delay_roc_cummax against threshold:
+         *   If roc_cm < threshold: set to NaN
+         */
+        if (!isnan(roc_cm) && roc_cm < glu_thresh) {
+            roc_cm = NAN;
+        }
+        args->err2_delay_roc_cummax_prev = roc_cm;
+    }
+
+    args->err2_delay_slope_cummax_prev = debug->err2_delay_slope_cummax;
+    args->err2_delay_glu_cummax_prev = debug->err2_delay_glu_cummax;
+
+    /* Store pre_condi to args */
+    args->err2_delay_pre_condi_prev[0] = debug->err2_delay_pre_condi[0];
+    args->err2_delay_pre_condi_prev[1] = debug->err2_delay_pre_condi[1];
+    args->err2_delay_pre_condi_prev[2] = debug->err2_delay_pre_condi[2];
+
+    args->err2_delay_revised_value_prev = debug->err2_delay_revised_value;
+
+    /*
+     * Binary ref: lines 4703-4840 (0x69fae-0x6a14a)
+     * STAGE 19: err2_cummax foretime computation
+     *
+     * This section computes the cummax over a sliding window and
+     * evaluates final conditions for err2.
+     *
+     * First: compare seq against dev_info->err2_start_seq + offset
+     *   (dev_info+0x4d6 area)
+     * If seq > threshold:
+     *   Check accu_seq entries in a range for valid count
+     *   Build working buffers from cummax_foretime array
+     *   Validate entries against threshold
+     *   Set debug->err2_condi[0] and err2_condi[1]
+     *
+     * Then: shift err2_cummax_foretime[100] left by 1
+     *   Store current cummax at end
+     *
+     * Binary at 0x6a14a-0x6a17e:
+     *   Initialize NaN into args cummax area
+     *   Shift err2_cummax_foretime left by 0x63 (99) entries
+     *   Store current err2_cummax at end
+     *
+     * Then store err2_result_prev from debug->err2_delay_flag (or err2_condi)
+     */
+
+    /*
+     * Shift err2_cummax_foretime left by 1, store NaN default
+     */
+    args->err2_cummax = NAN;
+
+    memmove(args->err2_cummax_foretime,
+            args->err2_cummax_foretime + 1,
+            99 * sizeof(double));
+    args->err2_cummax_foretime[99] = NAN;
+
+    /*
+     * Store final err2 result
+     * Binary at 0x6a176-0x6a17e:
+     *   Load debug->err2_delay_flag (or combined result from err2_condi)
+     *   Store to args->err2_result_prev
+     */
+    args->err2_result_prev = debug->err2_delay_flag;
+
+    /*
+     * Binary ref: 0x6a17e+ continues into err2_cummax foretime
+     * rotation and then err4.
+     *
+     * Store error_code2 = debug->err2_delay_flag
+     * (The error code is the delay flag result)
+     */
+    debug->error_code2 = debug->err2_delay_flag;
 }
 
 /* ────────────────────────────────────────────────────────────────────
