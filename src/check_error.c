@@ -254,7 +254,7 @@ static void check_err128(
 
         if (threshold_upper > val_d) {
             /* Spike above range -> set flag */
-            goto set_flag;
+            goto set_flag_path_a;
         }
 
         if (threshold_lower >= val_d) {
@@ -267,7 +267,7 @@ static void check_err128(
         double deviation_thresh = (double)dev_info->err345_min[0];
         double deviation = prev_normal - deviation_thresh;
         if (deviation > val_d) {
-            goto set_flag;
+            goto set_flag_path_a;
         }
 
         goto epilogue;
@@ -343,16 +343,24 @@ static void check_err128(
         uint16_t n_derivs = (valid_count > 1) ? (valid_count - 1) : 0;
 
         /*
+         * Binary ref: lines 226-260 (0x66920-0x66964)
          * The binary loads signal values from args+0x42f8 region
          * (the noise-revised array) and time values from args+0x644
-         * area (related to time_standard_arr).
+         * area (time_standard_arr adjusted by valid_count).
          *
-         * For the derivative computation we use the
-         * err128_CGM_c_noise_revised_value array and accu_seq
-         * for timing. The time base uses 60.0 (one minute).
+         * Derivative computation (from binary):
+         *   d17 = (double)time[i+1] - (double)time[i]   (seconds)
+         *   d17 = d17 / 60.0                            (to minutes)
+         *   d18 = signal[i+1] - signal[i]
+         *   d17 = d18 / d17                             (rate per minute)
+         *   store |d17| to derivatives buffer
+         *
+         * The time values come from accu_seq (r3 at args+0x644 area).
+         * The signal values from noise_revised array (r1 at args+0x4bf8).
+         *
+         * TODO: Verify time source array mapping with oracle.
          */
         for (uint16_t i = 0; i < n_derivs && i < 287; i++) {
-            /* Time differences from accu_seq (consecutive pair) */
             uint16_t idx_lo = (valid_count > i + 1) ? (288 - valid_count + i) : i;
             uint16_t idx_hi = idx_lo + 1;
             if (idx_lo >= 36 || idx_hi >= 36)
@@ -362,16 +370,24 @@ static void check_err128(
             double sig_hi = args->err128_CGM_c_noise_revised_value[idx_hi];
 
             /*
-             * Binary uses accu_seq pair for time base but divides by 60.0.
-             * The uint16_t -> double conversion and subtraction gives the
-             * time step. We approximate with a fixed 1.0 since accu_seq
-             * spacing is typically 1 minute.
+             * Binary computes time_diff = (time[i+1] - time[i]) / 60.0
+             * Using accu_seq as time proxy: delta_seq typically = 1,
+             * so time_diff_min = 1/60 ≈ 0.0167.
+             * derivative = sig_diff / time_diff_min
              *
-             * TODO: Verify time base computation from binary.
+             * TODO: Verify whether binary uses time_standard_arr or
+             * accu_seq for time values. Using accu_seq for now.
              */
-            double time_diff = 60.0;
+            uint16_t seq_lo = (idx_lo < 865) ? args->accu_seq[idx_lo] : 0;
+            uint16_t seq_hi = (idx_hi < 865) ? args->accu_seq[idx_hi] : 0;
+            double time_diff_sec = (double)seq_hi - (double)seq_lo;
+            double time_diff_min = time_diff_sec / 60.0;
+
+            if (time_diff_min <= 0.0)
+                time_diff_min = 1.0 / 60.0;  /* Guard: assume 1-second minimum */
+
             double sig_diff = sig_hi - sig_lo;
-            double deriv = sig_diff / time_diff;
+            double deriv = sig_diff / time_diff_min;
             derivatives[i] = fabs(deriv);
         }
 
@@ -467,26 +483,43 @@ static void check_err128(
         if (ratio >= ratio_threshold)
             goto epilogue;
 
-        goto set_flag;
+        goto set_flag_path_b;
     }
 
-set_flag:
+set_flag_path_a:
     /*
      * Binary ref: lines 331-338 (0x66a40-0x66a58)
      * Set err128_flag = 1
      *
      * strb #1 at r6+0x896  -> debug->err128_flag = 1
-     * Store revised value to debug+0x8a0 -> debug->err128_revised_value
-     * Copy prev_normal to debug->err128_normal from args+0xbc70+0x280
+     * vstr d17, [r0] at r6+0x8a0 -> debug->err128_revised_value = d17
+     * vldr d16, [r0, #640] at sp+0xf0 -> args+0xbc70+0x280 = args+0xbef0
+     * vstr d16, [r0] at sp+0x18c -> debug+0x898 = debug->err128_normal
+     *
+     * d17 differs by path:
+     *   Path A: d17 = *(args+0xbc70+0x278) = args->err128_normal_prev
+     *   Path B: d17 = *(sp+0xe4) = signal_history first element
+     *
+     * For Path A (from flag_prev==1 recurrence), d17 was loaded at
+     * line 0x6687a: vldr d17, [r0, #632] where r0=sp+0xf0=args+0xbc70.
+     * 632 = 0x278, so d17 = *(args+0xbc70+0x278) = err128_normal_prev.
      */
     debug->err128_flag = 1;
-    /* The revised value is the current signal value from the derivative
-     * analysis (d17 in the binary). Using the baseline value as
-     * approximation.
+    debug->err128_revised_value = args->err128_normal_prev;
+    debug->err128_normal = args->err128_normal_prev;
+    goto epilogue;
+
+set_flag_path_b:
+    /*
+     * For Path B (fresh spike detection), d17 was loaded at line 0x6698c:
+     * vldr d17, [r1] where r1=sp+0xe4=args+0x4be8 in binary layout.
+     * This is the first element of the signal region (sp+0xe4 area).
+     * In our packed struct, map to err128_CGM_c_noise_revised_value[0].
      *
-     * TODO: Verify which value exactly is stored as revised_value.
+     * TODO: Verify mapping of sp+0xe4 in binary to our packed struct.
      */
-    debug->err128_revised_value = debug->err128_normal;
+    debug->err128_flag = 1;
+    debug->err128_revised_value = args->err128_CGM_c_noise_revised_value[0];
 
     /* Copy prev normal from args storage area */
     debug->err128_normal = args->err128_normal_prev;
