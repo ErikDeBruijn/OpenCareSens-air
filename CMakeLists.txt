@@ -13,6 +13,7 @@ endif()
 # Static library
 add_library(caresens_air STATIC
     src/calibration.c
+    src/math_utils.c
 )
 target_include_directories(caresens_air PUBLIC src)
 
