@@ -887,6 +887,353 @@ static void test_smooth_sg_then_regress(void)
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * f_check_cgm_trend tests
+ * ════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Helper: set up accu_seq entries within the lookback window.
+ * Places n_entries valid sequence numbers starting from seq_start,
+ * so they satisfy: seq_val > (seq_current - n_back) AND seq_val <= seq_current.
+ */
+static void setup_accu_seq(struct air1_opcal4_arguments_t *args,
+                            uint16_t seq_current,
+                            uint16_t n_entries)
+{
+    for (int i = 0; i < 865; i++) {
+        if (i < (int)n_entries) {
+            /* Place valid entries: seq_current - n_entries + 1 + i */
+            args->accu_seq[i] = seq_current - n_entries + 1 + (uint16_t)i;
+        } else {
+            args->accu_seq[i] = 0; /* invalid */
+        }
+    }
+}
+
+static void test_f_check_cgm_trend_no_valid_entries(void)
+{
+    TEST("f_check_cgm_trend: no valid entries returns 1 (vacuous truth)");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+    /* No valid accu_seq entries (all zero from memset) */
+
+    double arr0[36], arr1[36];
+    for (int i = 0; i < 36; i++) { arr0[i] = 1.0; arr1[i] = 1.0; }
+    double *arrays[] = {arr0, arr1};
+    double thresholds[] = {0.5, 0.5};
+    uint8_t modes[] = {4, 4};
+
+    /* Mode 100: with n_valid=0, both counters are 0, XOR with 0 = 0, return 1 */
+    uint8_t result = f_check_cgm_trend(100, args, 100, 50, arrays, 2,
+                                        thresholds, 2, modes);
+    ASSERT_EQ(result, 1);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_mode100_all_pass(void)
+{
+    TEST("f_check_cgm_trend: mode 100, all entries pass le checks");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    /* Set up 10 valid entries */
+    setup_accu_seq(args, 500, 10);
+
+    double arr0[36], arr1[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = 0.3; /* all below threshold */
+        arr1[i] = 0.4;
+    }
+    double *arrays[] = {arr0, arr1};
+    double thresholds[] = {0.5, 0.5};
+    uint8_t modes[] = {4, 4};
+
+    uint8_t result = f_check_cgm_trend(100, args, 500, 200, arrays, 2,
+                                        thresholds, 2, modes);
+    ASSERT_EQ(result, 1);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_mode100_some_fail(void)
+{
+    TEST("f_check_cgm_trend: mode 100, some entries fail le checks");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    /* Set up 10 valid entries */
+    setup_accu_seq(args, 500, 10);
+
+    double arr0[36], arr1[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = 0.3;
+        arr1[i] = 0.4;
+    }
+    /* Make one entry in the valid range fail (last 10 elements = idx 26..35) */
+    arr0[30] = 1.0; /* exceeds threshold */
+    double *arrays[] = {arr0, arr1};
+    double thresholds[] = {0.5, 0.5};
+    uint8_t modes[] = {4, 4};
+
+    uint8_t result = f_check_cgm_trend(100, args, 500, 200, arrays, 2,
+                                        thresholds, 2, modes);
+    ASSERT_EQ(result, 0);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_mode_le2_first_stage_pass(void)
+{
+    TEST("f_check_cgm_trend: mode<=2, first stage passes, c doesn't match");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    setup_accu_seq(args, 500, 5);
+
+    double arr0[36], arr1[36], arr2[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = 0.2; /* passes le 0.5 */
+        arr1[i] = 0.3; /* passes le 0.5 */
+        arr2[i] = 0.1; /* does NOT pass gt 0.5 */
+    }
+    double *arrays[] = {arr0, arr1, arr2};
+    double thresholds[] = {0.5, 0.5, 0.5};
+    uint8_t modes[] = {4, 4, 1}; /* le, le, gt */
+
+    /* counter_a and counter_b should match n_valid => first_stage = 1
+     * counter_c = 0 (none pass gt 0.5) != n_valid => return first_stage */
+    uint8_t result = f_check_cgm_trend(1, args, 500, 200, arrays, 3,
+                                        thresholds, 3, modes);
+    ASSERT_EQ(result, 1);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_mode_le2_first_stage_fail(void)
+{
+    TEST("f_check_cgm_trend: mode<=2, first stage fails");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    setup_accu_seq(args, 500, 5);
+
+    double arr0[36], arr1[36], arr2[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = 1.0; /* FAILS le 0.5 */
+        arr1[i] = 0.3;
+        arr2[i] = 0.1;
+    }
+    double *arrays[] = {arr0, arr1, arr2};
+    double thresholds[] = {0.5, 0.5, 0.5};
+    uint8_t modes[] = {4, 4, 1};
+
+    /* counter_a = 0, doesn't match n_valid => first_stage = 0 */
+    uint8_t result = f_check_cgm_trend(2, args, 500, 200, arrays, 3,
+                                        thresholds, 3, modes);
+    ASSERT_EQ(result, 0);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_mode_le2_second_stage(void)
+{
+    TEST("f_check_cgm_trend: mode<=2, enters second stage");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    setup_accu_seq(args, 500, 5);
+
+    double arr0[36], arr1[36], arr2[36];
+    double arr3[36], arr4[36], arr5[36], arr6[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = 0.2; /* passes le 0.5 */
+        arr1[i] = 0.3; /* passes le 0.5 */
+        arr2[i] = 1.0; /* passes gt 0.5 */
+        arr3[i] = 0.1; /* passes le 0.5 */
+        arr4[i] = 0.1; /* passes le 0.5 */
+        arr5[i] = 0.1; /* passes le 0.5 */
+        arr6[i] = 0.1; /* passes le 0.5 */
+    }
+    double *arrays[] = {arr0, arr1, arr2, arr3, arr4, arr5, arr6};
+    double thresholds[] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
+    uint8_t modes[] = {4, 4, 1, 4, 4, 4, 4};
+
+    /* First stage: counter_a = counter_b = n_valid, first_stage = 1
+     * counter_c = n_valid, c_matches = 1 => enters second sub-loop
+     * Second stage: all 4 counters = n_valid => both pairs ok
+     * Result = 1 AND (1 OR 1) = 1 */
+    uint8_t result = f_check_cgm_trend(1, args, 500, 200, arrays, 7,
+                                        thresholds, 7, modes);
+    ASSERT_EQ(result, 1);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_mode_gt2_all_pass(void)
+{
+    TEST("f_check_cgm_trend: mode>2 (mode=3), all 4 comparisons pass");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    setup_accu_seq(args, 500, 8);
+
+    double arr0[36], arr1[36], arr2[36], arr3[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = 0.1;
+        arr1[i] = 0.2;
+        arr2[i] = 0.3;
+        arr3[i] = 0.4;
+    }
+    double *arrays[] = {arr0, arr1, arr2, arr3};
+    double thresholds[] = {0.5, 0.5, 0.5, 0.5};
+    uint8_t modes[] = {4, 4, 4, 4}; /* all le */
+
+    uint8_t result = f_check_cgm_trend(3, args, 500, 200, arrays, 4,
+                                        thresholds, 4, modes);
+    ASSERT_EQ(result, 1);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_mode_gt2_some_fail(void)
+{
+    TEST("f_check_cgm_trend: mode>2 (mode=4), one comparison fails");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    setup_accu_seq(args, 500, 8);
+
+    double arr0[36], arr1[36], arr2[36], arr3[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = 0.1;
+        arr1[i] = 0.2;
+        arr2[i] = 0.3;
+        arr3[i] = 0.4;
+    }
+    /* Make one entry in array 2 fail (idx 28..35 are the valid range) */
+    arr2[30] = 1.0;
+    double *arrays[] = {arr0, arr1, arr2, arr3};
+    double thresholds[] = {0.5, 0.5, 0.5, 0.5};
+    uint8_t modes[] = {4, 4, 4, 4};
+
+    uint8_t result = f_check_cgm_trend(4, args, 500, 200, arrays, 4,
+                                        thresholds, 4, modes);
+    ASSERT_EQ(result, 0);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_mode_ge5_extended(void)
+{
+    TEST("f_check_cgm_trend: mode>=5, 4-way pass + extended validation");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    setup_accu_seq(args, 500, 6);
+
+    /* 7 arrays: 4 for the SIMD check + 3 for extended */
+    double arr0[36], arr1[36], arr2[36], arr3[36];
+    double arr4[36], arr5[36], arr6[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = 0.1; /* passes le 0.5 */
+        arr1[i] = 0.2;
+        arr2[i] = 0.3;
+        arr3[i] = 0.4;
+        arr4[i] = -0.1; /* for lt check: -0.1 < 0.5 passes */
+        arr5[i] = 1.0;  /* for gt check: 1.0 > 0.5 passes */
+        arr6[i] = 1.0;  /* for gt check: 1.0 > 0.5 passes */
+    }
+    double *arrays[] = {arr0, arr1, arr2, arr3, arr4, arr5, arr6};
+    double thresholds[] = {0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5};
+    uint8_t modes[] = {4, 4, 4, 4, 2, 1, 2, 1, 1};
+    /* ext: lt, gt, lt(abs), gt, gt */
+
+    uint8_t result = f_check_cgm_trend(5, args, 500, 200, arrays, 7,
+                                        thresholds, 9, modes);
+    ASSERT_EQ(result, 1);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_n_valid_exceeds_36(void)
+{
+    TEST("f_check_cgm_trend: n_valid > 36 clamped to array bounds");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    /* Set up 100 valid entries (more than TREND_ARRAY_LEN=36) */
+    setup_accu_seq(args, 500, 100);
+
+    double arr0[36], arr1[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = 0.1;
+        arr1[i] = 0.2;
+    }
+    double *arrays[] = {arr0, arr1};
+    double thresholds[] = {0.5, 0.5};
+    uint8_t modes[] = {4, 4};
+
+    /* With n_valid=100, base_idx = 36-100 = -64, clamped to 0.
+     * All 36 entries checked. Should work without crashes. */
+    uint8_t result = f_check_cgm_trend(100, args, 500, 200, arrays, 2,
+                                        thresholds, 2, modes);
+
+    /* n_valid = 100, counter can be at most 36. 36 & 0xFF != 100 & 0xFF.
+     * So this should return 0 (counters don't match n_valid). */
+    ASSERT_EQ(result, 0);
+
+    free(args);
+    PASS();
+}
+
+static void test_f_check_cgm_trend_nan_data(void)
+{
+    TEST("f_check_cgm_trend: NaN data handled gracefully");
+
+    struct air1_opcal4_arguments_t *args = calloc(1, sizeof(*args));
+    memset(args, 0, sizeof(*args));
+
+    setup_accu_seq(args, 500, 5);
+
+    double arr0[36], arr1[36];
+    for (int i = 0; i < 36; i++) {
+        arr0[i] = NAN;
+        arr1[i] = NAN;
+    }
+    double *arrays[] = {arr0, arr1};
+    double thresholds[] = {0.5, 0.5};
+    uint8_t modes[] = {4, 4};
+
+    /* fun_comp_decimals returns 0 for NaN inputs,
+     * so counters stay 0, don't match n_valid=5 => return 0 */
+    uint8_t result = f_check_cgm_trend(100, args, 500, 200, arrays, 2,
+                                        thresholds, 2, modes);
+    ASSERT_EQ(result, 0);
+
+    free(args);
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * Main test runner
  * ════════════════════════════════════════════════════════════════════ */
 
@@ -929,6 +1276,19 @@ int main(void)
 
     printf("\n-- Integration --\n");
     test_smooth_sg_then_regress();
+
+    printf("\n-- f_check_cgm_trend --\n");
+    test_f_check_cgm_trend_no_valid_entries();
+    test_f_check_cgm_trend_mode100_all_pass();
+    test_f_check_cgm_trend_mode100_some_fail();
+    test_f_check_cgm_trend_mode_le2_first_stage_pass();
+    test_f_check_cgm_trend_mode_le2_first_stage_fail();
+    test_f_check_cgm_trend_mode_le2_second_stage();
+    test_f_check_cgm_trend_mode_gt2_all_pass();
+    test_f_check_cgm_trend_mode_gt2_some_fail();
+    test_f_check_cgm_trend_mode_ge5_extended();
+    test_f_check_cgm_trend_n_valid_exceeds_36();
+    test_f_check_cgm_trend_nan_data();
 
     printf("\n=== Results: %d passed, %d failed ===\n",
            tests_passed, tests_failed);

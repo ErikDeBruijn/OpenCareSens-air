@@ -1121,3 +1121,283 @@ void smooth1q_err16(double *input, uint32_t n, double *output)
         output[i] = accum;
     }
 }
+
+/* ========================================================================
+ * f_check_cgm_trend  --  CGM trend validation (err16 helper)
+ *
+ * From ARM disasm @ 0x6e498 (opcal4, 409 instructions).
+ *
+ * Validates trend data arrays against threshold criteria.
+ * Called 3 times from check_error for min/mode/mean trend validation.
+ *
+ * Three code paths based on mode:
+ *   mode == 100: 2-array le check (slope1, slope2)
+ *   mode <= 2:   3-array first pass + optional 4-comparison second pass
+ *   mode > 2:    4-array le check + optional extended validation (mode >= 5)
+ * ======================================================================== */
+
+/* Number of accu_seq entries in the validity scan (literal pool 0xfffff93e). */
+#define ACCU_SEQ_COUNT 865
+
+/* Length of each trend data array (rsb r0, r4, #0x24 => 0x24 = 36). */
+#define TREND_ARRAY_LEN 36
+
+/*
+ * count_valid_entries: Count accu_seq entries within the lookback window.
+ *
+ * From disassembly @ 0x6e4b8-0x6e4e8:
+ *   r12 = seq_current - n_back
+ *   For each seq_val in accu_seq[0..864]:
+ *     valid if seq_val != 0 AND seq_val <= seq_current
+ *     AND (seq_current - n_back) < seq_val
+ */
+static uint16_t count_valid_entries(
+    struct air1_opcal4_arguments_t *args,
+    uint16_t seq_current,
+    uint16_t n_back)
+{
+    uint16_t oldest = seq_current - n_back;
+    uint32_t n_valid = 0;
+
+    for (int i = 0; i < ACCU_SEQ_COUNT; i++) {
+        uint16_t seq_val = args->accu_seq[i];
+        if (seq_val != 0 && seq_val <= seq_current && oldest < seq_val)
+            n_valid++;
+    }
+    return (uint16_t)n_valid;
+}
+
+/*
+ * check_two_counters: Check if two counters both match n_valid.
+ *
+ * Implements the disassembly's return pattern:
+ *   ((c1 & 0xFF) ^ n_valid | (c2 & 0xFF) ^ n_valid) & 0xFFFF
+ *   clz >> 5 => 1 if zero (both match), 0 otherwise
+ */
+static inline uint8_t check_two_counters(uint32_t c1, uint32_t c2,
+                                          uint32_t n_valid)
+{
+    uint16_t combined = (uint16_t)(((c1 & 0xFF) ^ n_valid) |
+                                    ((c2 & 0xFF) ^ n_valid));
+    return combined == 0 ? 1 : 0;
+}
+
+uint8_t f_check_cgm_trend(
+    uint32_t mode,
+    struct air1_opcal4_arguments_t *args,
+    uint16_t seq_current,
+    uint16_t n_back,
+    double **arrays,
+    int n_arrays,
+    double *thresholds,
+    int n_thresholds,
+    uint8_t *comp_modes)
+{
+    /* Step 1: Count valid entries in the lookback window */
+    uint16_t n_valid = count_valid_entries(args, seq_current, n_back);
+
+    /* base_idx: only the last n_valid elements (out of 36) are checked.
+     * From disasm: rsb r0, r4, #0x24 => r0 = 36 - n_valid */
+    int base_idx = TREND_ARRAY_LEN - (int)n_valid;
+    if (base_idx < 0) base_idx = 0;
+
+    /* ================================================================
+     * Path A: mode == 100 (0x6e4ea-0x6e5e6)
+     *
+     * 2 arrays, 2 thresholds, both le(4) checks.
+     * Return 1 if ALL entries pass BOTH checks.
+     * ================================================================ */
+    if (mode == 100) {
+        uint32_t counter1 = 0;
+        uint32_t counter2 = 0;
+
+        for (int i = 0; i < (int)n_valid; i++) {
+            int idx = base_idx + i;
+            if (idx < 0 || idx >= TREND_ARRAY_LEN) continue;
+
+            if (fun_comp_decimals(arrays[0][idx], thresholds[0], 10, 4))
+                counter1++;
+            if (fun_comp_decimals(arrays[1][idx], thresholds[1], 10, 4))
+                counter2++;
+        }
+
+        return check_two_counters(counter1, counter2, (uint32_t)n_valid);
+    }
+
+    /* ================================================================
+     * Path C: mode <= 2 (0x6e60a-0x6e8a4)
+     *
+     * First sub-loop: 3 comparisons per entry
+     *   arrays[0][idx] with comp_modes[0] => counter_a
+     *   arrays[1][idx] with comp_modes[1] => counter_b
+     *   arrays[2][idx] with comp_modes[2] => counter_c
+     *
+     * If counter_c doesn't match n_valid: return first_stage result.
+     * If counter_c matches: enter second sub-loop with 4 more checks.
+     * ================================================================ */
+    if (mode <= 2) {
+        uint32_t counter_a = 0;
+        uint32_t counter_b = 0;
+        uint32_t counter_c = 0;
+
+        for (int i = 0; i < (int)n_valid; i++) {
+            int idx = base_idx + i;
+            if (idx < 0 || idx >= TREND_ARRAY_LEN) continue;
+
+            if (fun_comp_decimals(arrays[0][idx], thresholds[0], 10,
+                                  comp_modes[0]))
+                counter_a++;
+            if (fun_comp_decimals(arrays[1][idx], thresholds[1], 10,
+                                  comp_modes[1]))
+                counter_b++;
+            if (fun_comp_decimals(arrays[2][idx], thresholds[2], 10,
+                                  comp_modes[2]))
+                counter_c++;
+        }
+
+        /* First-stage check (0x6e796) */
+        uint8_t first_stage = check_two_counters(counter_b, counter_a,
+                                                  (uint32_t)n_valid);
+
+        /* Check counter_c matches n_valid (0x6e7b6) */
+        uint8_t c_matches = ((uint32_t)n_valid == (counter_c & 0xFF)) ? 1 : 0;
+
+        if (!c_matches)
+            return first_stage;
+
+        /* Second sub-loop: 4 more comparisons (0x6e7bc-0x6e854)
+         *
+         * From disasm, uses 2 pairs of contiguous arrays (4 total),
+         * each with le(4) comparison against separate thresholds.
+         *
+         * arrays[3..6], thresholds[3..6], comp_modes[3..6] */
+        if (n_arrays < 7 || n_thresholds < 7)
+            return first_stage;
+
+        uint32_t counter_d = 0; /* r11 */
+        uint32_t counter_e = 0; /* r9  */
+        uint32_t counter_f = 0; /* sp+0x18 */
+        uint32_t counter_g = 0; /* r10 */
+
+        for (int i = 0; i < (int)n_valid; i++) {
+            int idx = base_idx + i;
+            if (idx < 0 || idx >= TREND_ARRAY_LEN) continue;
+
+            if (fun_comp_decimals(arrays[3][idx], thresholds[3], 10,
+                                  comp_modes[3]))
+                counter_f++;
+            if (fun_comp_decimals(arrays[4][idx], thresholds[4], 10,
+                                  comp_modes[4]))
+                counter_d++;
+            if (fun_comp_decimals(arrays[5][idx], thresholds[5], 10,
+                                  comp_modes[5]))
+                counter_e++;
+            if (fun_comp_decimals(arrays[6][idx], thresholds[6], 10,
+                                  comp_modes[6]))
+                counter_g++;
+        }
+
+        /* Return: first_stage AND (pair1_ok OR pair2_ok)
+         * pair1 = (counter_g, counter_e), pair2 = (counter_d, counter_f) */
+        uint8_t pair1_ok = check_two_counters(counter_g, counter_e,
+                                               (uint32_t)n_valid);
+        uint8_t pair2_ok = check_two_counters(counter_d, counter_f,
+                                               (uint32_t)n_valid);
+
+        return first_stage & (pair1_ok | pair2_ok);
+    }
+
+    /* ================================================================
+     * Path B: mode > 2 (0x6e558-0x6e8e8, SIMD-style path)
+     *
+     * 4-way check: arrays[0..3] against thresholds[0..3].
+     * Builds a 4-bit bitmask (all entries passed each comparison).
+     *
+     * mode < 5 (3, 4): return bitmask == 0x0F
+     * mode >= 5:       if bitmask == 0x0F, extended 5-comparison check
+     * ================================================================ */
+    uint32_t pass_count[4] = {0, 0, 0, 0};
+
+    for (int i = 0; i < (int)n_valid; i++) {
+        int idx = base_idx + i;
+        if (idx < 0 || idx >= TREND_ARRAY_LEN) continue;
+
+        for (int c = 0; c < 4 && c < n_arrays; c++) {
+            if (fun_comp_decimals(arrays[c][idx], thresholds[c], 10,
+                                  comp_modes[c]))
+                pass_count[c]++;
+        }
+    }
+
+    /* Bitmask: SIMD uint16 lane comparison (0x6e678-0x6e6b2) */
+    uint32_t bitmask = 0;
+    uint16_t nv_byte = (uint16_t)(n_valid & 0xFF);
+    for (int c = 0; c < 4; c++) {
+        if ((pass_count[c] & 0xFF) == nv_byte)
+            bitmask |= (1u << c);
+    }
+    bitmask &= 0x0F;
+
+    /* mode < 5: simple bitmask check (0x6e67e cmp r11,#5; blo 0x6e856) */
+    if (mode < 5)
+        return (bitmask == 0x0F) ? 1 : 0;
+
+    /* mode >= 5: require 4-way pass to continue */
+    if (bitmask != 0x0F)
+        return 0;
+
+    /* Extended validation (0x6e6ba-0x6e8e8):
+     * 5 comparisons per entry using arrays[4..6] and thresholds[4..8].
+     *
+     * From disasm (0x6e700-0x6e78e):
+     *   1. arrays[4][idx], comp_modes[4] => counter1
+     *   2. arrays[5][idx], comp_modes[5] => counter2
+     *   3. abs(arrays[4][idx]), comp_modes[6] => counter3
+     *   4. arrays[5][idx], comp_modes[7] => counter4
+     *   5. arrays[6][idx], comp_modes[8] => counter5
+     */
+    if (n_arrays < 7 || n_thresholds < 9)
+        return 0;
+
+    uint32_t ext_c1 = 0, ext_c2 = 0, ext_c3 = 0, ext_c4 = 0, ext_c5 = 0;
+
+    for (int i = 0; i < (int)n_valid; i++) {
+        int idx = base_idx + i;
+        if (idx < 0 || idx >= TREND_ARRAY_LEN) continue;
+
+        if (fun_comp_decimals(arrays[4][idx], thresholds[4], 10,
+                              comp_modes[4]))
+            ext_c1++;
+        if (fun_comp_decimals(arrays[5][idx], thresholds[5], 10,
+                              comp_modes[5]))
+            ext_c2++;
+
+        /* abs() comparison (0x6e72e-0x6e746) */
+        double abs_val = fabs(arrays[4][idx]);
+        if (fun_comp_decimals(abs_val, thresholds[6], 10,
+                              comp_modes[6]))
+            ext_c3++;
+
+        if (fun_comp_decimals(arrays[5][idx], thresholds[7], 10,
+                              comp_modes[7]))
+            ext_c4++;
+        if (fun_comp_decimals(arrays[6][idx], thresholds[8], 10,
+                              comp_modes[8]))
+            ext_c5++;
+    }
+
+    /* Return logic (0x6e85a-0x6e8e8, Ghidra lines 8210-8226):
+     * counter5 must match n_valid, AND either:
+     *   Path 1: counter1 AND counter2 both match n_valid
+     *   Path 2: counter3 AND counter4 both match n_valid */
+    uint8_t c5_ok = ((ext_c5 & 0xFF) == (n_valid & 0xFF)) ? 1 : 0;
+    if (!c5_ok)
+        return 0;
+
+    uint8_t c1_ok = ((ext_c1 & 0xFF) == (n_valid & 0xFF)) ? 1 : 0;
+    uint8_t c2_ok = ((ext_c2 & 0xFF) == (n_valid & 0xFF)) ? 1 : 0;
+    if (c1_ok && c2_ok)
+        return 1;
+
+    return check_two_counters(ext_c4, ext_c3, (uint32_t)n_valid);
+}

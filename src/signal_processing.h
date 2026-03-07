@@ -156,4 +156,57 @@ void f_cgm_trend(struct air1_opcal4_arguments_t *args,
  */
 void smooth1q_err16(double *input, uint32_t n, double *output);
 
+/*
+ * f_check_cgm_trend: CGM trend validation for error detection (err16).
+ *
+ * From ARM disasm @ 0x6e498 (opcal4, 409 instructions).
+ *
+ * Validates computed CGM trend data against threshold criteria.
+ * Called 3 times from check_error (by the err16 detector) to validate
+ * min trend, mode trend, and mean trend data.
+ *
+ * Parameters:
+ *   mode:        Validation mode. Determines which code path is taken:
+ *                  100: simple 2-array le check (min trend slope1/slope2)
+ *                  <= 2: 3-array first pass (le, le, gt) + optional 6-check second pass
+ *                  > 2:  4-array SIMD-style check + optional extended validation (mode > 5)
+ *   args:        Pointer to arguments_t (contains accu_seq for validity checking)
+ *   seq_current: Current sequence number (used for validity window)
+ *   n_back:      Lookback parameter: entries with seq > (seq_current - n_back) are valid
+ *   arrays:      Array of pointers to 36-element double arrays to validate.
+ *                The number and meaning depend on mode:
+ *                  mode 100: arrays[0]=slope1, arrays[1]=slope2
+ *                  mode <= 2 (first pass): arrays[0]=slope1, arrays[1]=slope2, arrays[2]=proportion/diff
+ *                  mode <= 2 (second pass, if entered): arrays[3..8] for rsq/diff/ratio checks
+ *                  mode > 2: arrays[0..3] for 4-way check (diff, ratio, slope1, slope2)
+ *                  mode > 5: arrays[4..9] for extended check
+ *   n_arrays:    Total number of array pointers in arrays[].
+ *   thresholds:  Array of threshold doubles for comparisons.
+ *                The number depends on mode:
+ *                  mode 100: 2 thresholds
+ *                  mode <= 2: 3 first-pass + up to 7 second-pass thresholds
+ *                  mode > 2: 4 thresholds + up to 6 extended thresholds
+ *   n_thresholds: Total number of thresholds.
+ *   comp_modes:  Array of fun_comp_decimals modes (1=gt, 2=lt, 3=ge, 4=le, 5=eq)
+ *                for each comparison. Length matches n_thresholds.
+ *
+ * Returns:
+ *   1 if the trend data passes all validation checks, 0 otherwise.
+ *
+ * Validity counting:
+ *   Before checking data, counts how many of the 865 accu_seq entries
+ *   satisfy: seq_val > 0, seq_val <= seq_current, seq_val > (seq_current - n_back).
+ *   Only the last n_valid entries (out of 36) are checked.
+ */
+uint8_t f_check_cgm_trend(
+    uint32_t mode,
+    struct air1_opcal4_arguments_t *args,
+    uint16_t seq_current,
+    uint16_t n_back,
+    double **arrays,
+    int n_arrays,
+    double *thresholds,
+    int n_thresholds,
+    uint8_t *comp_modes);
+
 #endif /* SIGNAL_PROCESSING_H */
