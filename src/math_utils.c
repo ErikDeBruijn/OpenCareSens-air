@@ -48,6 +48,10 @@ double math_mean(double *buffer, uint16_t count)
         /* NaN values contribute 0.0 to sum (skipped) */
     }
 
+    if (valid == 0) {
+        return NAN; /* all elements were NaN */
+    }
+
     return sum / (double)valid;
 }
 
@@ -163,7 +167,7 @@ double math_ceil(double num)
         return NAN;
     }
 
-    int trunc = (int)(int64_t)num;
+    int64_t trunc = (int64_t)num;
     /* Add 1 if positive, non-zero, and has fractional part */
     if (num > 0.0 && (double)trunc != num) {
         trunc += 1;
@@ -303,6 +307,7 @@ double quick_select(double *arr, uint16_t arr_size, uint16_t k)
     double pivot = math_median(samples, 5);
 
     /* Partition into less, equal, greater */
+    /* Partition arrays sized to match binary's maximum expected input */
     double less[2400];
     double greater[2400];
     uint16_t n_less = 0;
@@ -312,9 +317,13 @@ double quick_select(double *arr, uint16_t arr_size, uint16_t k)
     for (unsigned int i = 0; i < arr_size; i++) {
         double val = arr[i];
         if (val < pivot) {
-            less[n_less++] = val;
+            if (n_less < 2400) {
+                less[n_less++] = val;
+            }
         } else if (val > pivot) {
-            greater[n_greater++] = val;
+            if (n_greater < 2400) {
+                greater[n_greater++] = val;
+            }
         } else {
             n_equal++;
         }
@@ -450,6 +459,12 @@ uint8_t fun_comp_decimals(double in1, double in2, uint8_t num_digits, uint8_t mo
  */
 double cal_average_without_min_max(double *arr, int len)
 {
+    /* Original binary does not guard len — it always receives >= 3 elements
+     * from the caller. Guard here to prevent UB on degenerate input. */
+    if (len < 3) {
+        return (len > 0) ? arr[0] : NAN;
+    }
+
     double max_val = arr[0];
     double min_val = arr[0];
     double sum = 0.0;
@@ -512,6 +527,9 @@ double cal_average_without_min_max(double *arr, int len)
 uint8_t check_boundary(double Cslope_new, double Cycept_new,
                         struct air1_opcal4_device_info_t *dev_info)
 {
+    /* Cycept_new will be used once the full parallelogram check is implemented */
+    (void)Cycept_new;
+
     /*
      * From the opcal4 disassembly at 0x6d3d8, the function loads 5 doubles
      * from a base pointer at offsets 752, 744, 736, 728, and 760 bytes.
@@ -576,8 +594,7 @@ double calcPercentile(double *array, uint16_t size, uint8_t percent)
 
     for (unsigned int i = 0; i < size; i++) {
         double val = array[i];
-        double abs_val = fabs(val);
-        /* Original checks: abs(val) != Inf AND !isnan(abs_val) AND !isnan(Inf)
+        /* Original checks: abs(val) != Inf AND !isnan(abs(val)) AND !isnan(Inf)
          * Effectively: not NaN and not Inf */
         if (!isnan(val) && !isinf(val)) {
             clean[valid++] = val;
@@ -629,6 +646,10 @@ double f_trimmed_mean(double *data, uint16_t len, uint8_t th)
             sum += val;
             count++;
         }
+    }
+
+    if (count == 0) {
+        return math_mean(data, len); /* no values in range — fall back to full mean */
     }
 
     return sum / (double)count;
@@ -1036,7 +1057,10 @@ void fit_simple_regression(double *x, double *y, int n, double *result)
         }
     }
 
-    uint8_t count = (uint8_t)valid;
+    /* Use int for count — original binary uses uint8_t register but n is
+     * always <= 300 due to the clean array size. Using int avoids silent
+     * wraparound if n > 255. */
+    int count = valid;
     double mean_x = sum_x / (double)count;
     double mean_y = sum_y / (double)count;
 
