@@ -14,7 +14,6 @@
 #   --device <serial>  Use specific adb device
 #   --lib <path>       Override path to libCALCULATION.so
 #   --output <dir>     Override output directory (default: ./output)
-#   --readings <n>     Override number of readings (requires recompile)
 #
 # Prerequisites:
 #   adb mode:  Android NDK installed, Android device connected via USB
@@ -82,7 +81,7 @@ adb)
     # shellcheck disable=SC2086
     adb $ADB_DEVICE devices -l
     # shellcheck disable=SC2086
-    adb $ADB_DEVICE shell "echo 'Device OK: $(getprop ro.product.model 2>/dev/null || echo unknown)'"
+    adb $ADB_DEVICE shell 'echo "Device OK: $(getprop ro.product.model 2>/dev/null || echo unknown)"'
 
     echo ""
     echo "=== Deploying to device ==="

@@ -22,7 +22,6 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <math.h>
-#include <time.h>
 
 /* Include the struct definitions from src/ */
 #include "../src/calibration.h"
@@ -117,7 +116,10 @@ static int write_bin(const char *path, const void *data, size_t size) {
         fclose(f);
         return -1;
     }
-    fclose(f);
+    if (fclose(f) != 0) {
+        fprintf(stderr, "ERROR: Failed to flush %s: %s\n", path, strerror(errno));
+        return -1;
+    }
     return 0;
 }
 
@@ -554,22 +556,28 @@ int main(int argc, char *argv[]) {
             /* Save input */
             snprintf(path, sizeof(path), "%s/seq_%04d_input.bin", session_dir, seq);
             if (write_bin(path, &cgm_input, sizeof(cgm_input)) != 0) {
+                fprintf(stderr, "FATAL: Aborting session %s at seq %d due to I/O error\n",
+                        cfg->name, seq);
                 session_errors++;
-                continue;
+                break;
             }
 
             /* Save output */
             snprintf(path, sizeof(path), "%s/seq_%04d_output.bin", session_dir, seq);
             if (write_bin(path, &output, sizeof(output)) != 0) {
+                fprintf(stderr, "FATAL: Aborting session %s at seq %d due to I/O error\n",
+                        cfg->name, seq);
                 session_errors++;
-                continue;
+                break;
             }
 
             /* Save debug (THE ORACLE) */
             snprintf(path, sizeof(path), "%s/seq_%04d_debug.bin", session_dir, seq);
             if (write_bin(path, &debug, sizeof(debug)) != 0) {
+                fprintf(stderr, "FATAL: Aborting session %s at seq %d due to I/O error\n",
+                        cfg->name, seq);
                 session_errors++;
-                continue;
+                break;
             }
 
             /* Save arguments checkpoint if applicable */

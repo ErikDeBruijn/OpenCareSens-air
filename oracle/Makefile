@@ -79,7 +79,7 @@ arm: check-ndk $(BUILD_DIR)/oracle_harness_arm
 $(BUILD_DIR)/oracle_harness_arm: oracle_harness.c ../src/calibration.h | $(BUILD_DIR)
 	$(ARM_CC) $(ARM_CFLAGS) -o $@ $< -ldl -lm
 	@echo "Built: $@ ($(shell file $@))"
-	@echo "Size: $(shell stat -f%z $@ 2>/dev/null || stat -c%s $@ 2>/dev/null) bytes"
+	@echo "Size: $$(stat -f%z $@ 2>/dev/null || stat -c%s $@ 2>/dev/null) bytes"
 
 # ── Native build (for struct verification and development) ──
 
