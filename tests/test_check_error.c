@@ -12,8 +12,8 @@
 #include <string.h>
 #include <float.h>
 
-#include "check_error.h"
 #include "calibration.h"
+#include "check_error.h"
 
 static int tests_passed = 0;
 static int tests_failed = 0;
