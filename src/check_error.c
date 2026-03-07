@@ -1385,8 +1385,40 @@ static void check_err16(
 /* ────────────────────────────────────────────────────────────────────
  * err1: Contact/noise detector (most complex)
  *
- * From check_error.asm ~line 3500 through ~line 5200.
- * Detects poor sensor contact and excessive noise.
+ * From check_error.asm ~line 3500 through ~line 7997.
+ * Address range: 0x690b8 through 0x6c5c4.
+ * ~1265 lines of disassembly, ~1000 ARM instructions.
+ *
+ * Detects poor sensor contact and excessive noise using:
+ *   - 180-element signal/time/current histories
+ *   - 100-element contact quality histories
+ *   - SSE mean computations with absolute-difference smoothing
+ *   - 7 independent temporal discontinuity (TD) trio evaluations
+ *   - Linear regression + R-squared quality assessment
+ *   - cal_threshold for adaptive threshold computation
+ *
+ * Algorithm structure (6 stages):
+ *   Stage 1: Load thresholds, initialize debug, early exit if low seq
+ *   Stage 2: SSE mean evaluation via err1_TD_var_update + smoothing
+ *   Stage 3: Contact quality assessment (diff vs threshold)
+ *   Stage 4: 180-element signal history update
+ *   Stage 5: Temporal Discontinuity detection (7 trio evaluations)
+ *   Stage 6: Final decision with hysteresis
+ *
+ * Binary register mapping (during TD section):
+ *   r6 / sp+0x148  = debug pointer
+ *   sp+0x14c       = args pointer
+ *   sp+0xf4        = dev_info pointer
+ *   sp+0x9c        = args pointer (alternate)
+ *   d8             = threshold for TD trio comparisons
+ *   d9             = SSE mean / current avg diff
+ *   d13            = SSE threshold
+ *   d15            = time divisor (60.0 for seconds-to-minutes)
+ *   sp+0x194       = var_count (uint16_t, TD var element count)
+ *   sp+0x196       = total_count (uint16_t, running sum)
+ *   sp+0x191       = break_flag_count (uint8_t)
+ *   sp+0x192       = trio_flag (uint8_t)
+ *   sp+0x193       = trio_count (uint8_t)
  * ──────────────────────────────────────────────────────────────────── */
 static void check_err1(
     struct air1_opcal4_arguments_t *args,
@@ -1395,9 +1427,1189 @@ static void check_err1(
     uint16_t seq_current,
     double glucose_value)
 {
-    /* TODO: Implement err1 detector (contact/noise) */
-    (void)args; (void)dev_info; (void)debug;
-    (void)seq_current; (void)glucose_value;
+    (void)seq_current;  /* seq_val computed from args->idx */
+    (void)glucose_value;
+
+    /*
+     * ── STAGE 1: Initialization ──
+     *
+     * Binary ref: lines ~3500-3520 (combined with the cal_threshold setup)
+     *
+     * Load device_info thresholds and compute derived values.
+     * Initialize debug outputs to safe defaults.
+     * Check sequence threshold for early exit.
+     */
+
+    /* Load thresholds from device_info */
+    uint8_t err1_seq0 = dev_info->err1_seq[0];
+    uint8_t err1_seq1 = dev_info->err1_seq[1];
+    uint8_t err1_seq2 = dev_info->err1_seq[2];
+    double th_diff_devinfo = (double)dev_info->err1_th_diff;
+    double th_sse_dmean0 = (double)dev_info->err1_th_sse_dmean[0];
+    double th_sse_dmean1 = (double)dev_info->err1_th_sse_dmean[1];
+    double th_sse_dmean2 = (double)dev_info->err1_th_sse_dmean[2];
+    double current_avg_diff_threshold = (double)dev_info->err1_current_avg_diff;
+
+    /*
+     * Initialize output fields that the binary always sets, even
+     * when taking the early-exit path (seq below threshold).
+     * These are the "gate" fields that downstream detectors read.
+     */
+    debug->err1_is_contact_bad = 0;
+    debug->err1_random_noise_temp_break = 0;
+    debug->err1_result = 0;
+    debug->error_code1 = 0;
+
+    /*
+     * Load sequence value from args->idx.
+     * Binary ref: lines ~3904-3912 (0x695a4: ldrsh.w r4, [lr, #0x648])
+     * 0x648 is offset of idx in binary's aligned args struct.
+     *
+     * TODO: Verify idx mapping — binary reads from args+0x648.
+     */
+    uint16_t seq_val = args->idx;
+
+    /*
+     * Variables that must be visible at all labels (final_decision, epilogue).
+     * Declared here before any goto targets.
+     */
+    uint8_t is_contact_bad = 0;
+    uint16_t total_breaks = 0;
+    uint8_t result_condition_TD0 = 0;
+    uint8_t result_condition_TD1 = 0;
+    uint16_t n_last_threshold = dev_info->err1_n_last;
+
+    /* Early exit: if seq is below minimum threshold, skip */
+    if (seq_val < (uint16_t)err1_seq0) {
+        /* Store updated state and return */
+        goto epilogue;
+    }
+
+    /*
+     * ── Main-body debug initialization ──
+     *
+     * Initialize debug output fields to safe defaults. These are only
+     * written when err1 does its full processing (seq >= threshold).
+     * The binary does not touch these fields on the early-exit path,
+     * so downstream detectors see whatever was already in the debug
+     * struct (e.g., values from a previous call).
+     */
+    debug->err1_i_sse_d_mean = NAN;
+    debug->err1_th_sse_d_mean1 = NAN;
+    debug->err1_th_sse_d_mean2 = NAN;
+    debug->err1_th_sse_d_mean = NAN;
+    debug->err1_current_avg_diff = NAN;
+    debug->err1_th_diff1 = NAN;
+    debug->err1_th_diff2 = NAN;
+    debug->err1_th_diff = NAN;
+    debug->err1_isfirst0 = args->err1_isfirst0;
+    debug->err1_isfirst1 = args->err1_isfirst1;
+    debug->err1_isfirst2 = args->err1_isfirst2;
+    debug->err1_n = args->err1_n;
+    debug->err1_length_t2_max = 0;
+    debug->err1_length_t3_max = 0;
+    debug->err1_length_t1_trio = 0;
+    debug->err1_length_t2_trio = 0;
+    debug->err1_length_t3_trio = 0;
+    debug->err1_length_t6_trio = 0;
+    debug->err1_length_t7_trio = 0;
+    debug->err1_length_t8_trio = 0;
+    debug->err1_length_t9_trio = 0;
+    debug->err1_length_t10_trio = 0;
+    debug->err1_result_TD = 0;
+    debug->err1_result_condition_TD[0] = 0;
+    debug->err1_result_condition_TD[1] = 0;
+    debug->err1_TD_count = 0;
+    debug->err1_TD_temporary_break_flag = 0;
+    memset(debug->err1_TD_time_trio, 0, sizeof(debug->err1_TD_time_trio));
+    memset(debug->err1_TD_value_trio, 0, sizeof(debug->err1_TD_value_trio));
+
+    /*
+     * ── STAGE 2: SSE Mean Evaluation ──
+     *
+     * Binary ref: lines ~3500-3700 (0x690b8-0x693b4)
+     *
+     * The binary calls cal_threshold twice to compute adaptive
+     * SSE-difference-mean and current-difference thresholds. This
+     * updates args->err1_th_sse_d_mean{1,2}, err1_th_diff{1,2},
+     * err1_isfirst{0,1,2}, and err1_n.
+     *
+     * The SSE computation works on the curr_avg_arr history, computing
+     * absolute differences between consecutive elements, then deriving
+     * mean and accumulated statistics.
+     *
+     * We compute the current average difference from the curr_avg_arr
+     * using the most recent entries.
+     *
+     * TODO: The exact SSE computation involves a Hann-window smoothed
+     * loop that the binary does at lines 6750-6775. The binary computes
+     * abs(arr[i+1] - arr[i]) for 0x598/8 = 179 elements, storing to
+     * a temp buffer. This implements a difference-based SSE metric.
+     * Exact binary-to-struct mapping needs oracle verification.
+     */
+
+    /*
+     * Compute absolute-difference array from curr_avg_arr[0..179].
+     *
+     * Binary ref: lines 6750-6775 (0x6b6ea-0x6b738)
+     *   The binary loads from args+0x5b58 area (curr_avg_arr in binary layout),
+     *   computes |arr[i+1] - arr[i]| for i = 0..178, stores to temp buffer.
+     *   Loop count: 0x598/8 = 179 iterations.
+     *
+     * TODO: Verify that curr_avg_arr is the correct source array.
+     * In our packed struct, curr_avg_arr is at offset 0xf53 while the
+     * binary accesses args+0x5b58. The offset difference reflects
+     * different struct alignment.
+     */
+    double abs_diff_buf[180];
+    memset(abs_diff_buf, 0, sizeof(abs_diff_buf));
+
+    /* Compute absolute differences of consecutive curr_avg_arr entries */
+    for (int i = 0; i < 179; i++) {
+        double diff = args->curr_avg_arr[i + 1] - args->curr_avg_arr[i];
+        abs_diff_buf[i] = fabs(diff);
+    }
+
+    /*
+     * ── err1_TD_var_update #1 ──
+     *
+     * Binary ref: line 6748 (0x6b6dc: bl err1_TD_var_update)
+     *
+     * Rotates 90-element variance tracking arrays. The first call uses
+     * stack arrays as source and destination, corresponding to the
+     * "current window" and "previous window" of the TD analysis.
+     *
+     * In our C model, these stack arrays map to the err1 180-element
+     * signal/time/current arrays split into two 90-element halves.
+     *
+     * We model this by shifting the 180-element histories.
+     */
+
+    /* TD var state: use the sequence counts for the var tracking */
+    uint16_t var_seq_buf[90];
+    double   var_val_buf[90];
+    uint32_t var_time_buf[90];
+    uint16_t var_seq_buf2[90];
+    double   var_val_buf2[90];
+    uint32_t var_time_buf2[90];
+    uint16_t var_sum1 = 0;
+    uint16_t var_sum2 = 0;
+
+    memset(var_seq_buf, 0, sizeof(var_seq_buf));
+    memset(var_val_buf, 0, sizeof(var_val_buf));
+    memset(var_time_buf, 0, sizeof(var_time_buf));
+    memset(var_seq_buf2, 0, sizeof(var_seq_buf2));
+    memset(var_val_buf2, 0, sizeof(var_val_buf2));
+    memset(var_time_buf2, 0, sizeof(var_time_buf2));
+
+    /* First var_update: copy from "src" (current) to "dest" (previous) */
+    err1_TD_var_update(var_seq_buf, var_val_buf, var_time_buf, &var_sum1,
+                       var_val_buf2, var_time_buf2, &var_sum2);
+
+    /*
+     * ── Absolute-difference accumulation loop ──
+     *
+     * Binary ref: lines 6750-6775 (0x6b6ea-0x6b73a)
+     * The binary loads entries from the curr_avg_arr area (args+0x5b58)
+     * and computes absolute differences. It then accumulates a count
+     * (stored at sp+0x194) of valid (non-NaN, below-threshold) entries.
+     *
+     * This determines the "density" of the signal — how many consecutive
+     * readings show small changes (good contact) vs large jumps (noise).
+     */
+
+    (void)0;  /* var_count (sp+0x194 in binary) used internally by TD processing */
+
+    /*
+     * Binary ref: lines 6776-6835 (0x6b73a-0x6b7e2)
+     *
+     * The binary computes a refined count by iterating over the var arrays
+     * and filtering based on multiple criteria:
+     *   1. Match sequence indices against a 180-element reference array
+     *   2. Check values against threshold (d13 = SSE threshold)
+     *   3. Filter NaN entries
+     *
+     * The result is stored into total_count (sp+0x196).
+     */
+
+    /* Compute the current average difference for contact quality check */
+    double curr_avg_now = 0.0;
+    double curr_avg_prev = args->err1_prev_last_1min_curr;
+    uint16_t n_curr = args->err1_n;
+
+    /* Look at the most recent curr_avg_arr entries to compute a difference */
+    if (seq_val > 0 && seq_val <= 865) {
+        curr_avg_now = args->curr_avg_arr[seq_val - 1];
+    }
+    double current_avg_diff = fabs(curr_avg_now - curr_avg_prev);
+
+    /*
+     * ── cal_threshold calls ──
+     *
+     * Binary ref: lines ~3540-3568 (0x6914a, 0x69196)
+     *
+     * Two calls to cal_threshold:
+     *   1. For SSE-difference-mean thresholds (mode 1)
+     *   2. For current-difference thresholds (mode 0)
+     *
+     * cal_threshold updates:
+     *   - args->err1_n (accumulation count)
+     *   - args->err1_th_sse_d_mean / err1_th_diff (threshold values)
+     *   - args->err1_isfirst{0,1,2} (initialization flags)
+     *
+     * The binary passes the abs-diff SSE metric and the current_avg_diff
+     * to the two cal_threshold calls respectively.
+     */
+
+    /* Compute SSE-like metric: mean of absolute differences */
+    double sse_d_mean = 0.0;
+    int sse_count = 0;
+    for (int i = 0; i < 179; i++) {
+        if (!isnan(abs_diff_buf[i]) && abs_diff_buf[i] > 0.0) {
+            sse_d_mean += abs_diff_buf[i];
+            sse_count++;
+        }
+    }
+    if (sse_count > 0) {
+        sse_d_mean /= (double)sse_count;
+    }
+
+    /* First cal_threshold call: SSE-difference-mean threshold */
+    cal_threshold(&args->err1_n,
+                  &args->err1_th_sse_d_mean1,
+                  &args->err1_th_diff1,
+                  &args->err1_isfirst0,
+                  n_curr,
+                  1, /* mode = 1 */
+                  sse_d_mean,
+                  current_avg_diff,
+                  args->err1_th_sse_d_mean2,
+                  args->err1_th_diff2,
+                  dev_info);
+
+    /* Second cal_threshold call: current-diff threshold */
+    cal_threshold(&args->err1_n,
+                  &args->err1_th_sse_d_mean2,
+                  &args->err1_th_diff2,
+                  &args->err1_isfirst1,
+                  n_curr,
+                  0, /* mode = 0 */
+                  sse_d_mean,
+                  current_avg_diff,
+                  args->err1_th_sse_d_mean,
+                  args->err1_th_diff,
+                  dev_info);
+
+    /* Store intermediate debug results */
+    debug->err1_i_sse_d_mean = sse_d_mean;
+    debug->err1_current_avg_diff = current_avg_diff;
+    debug->err1_th_sse_d_mean1 = args->err1_th_sse_d_mean1;
+    debug->err1_th_sse_d_mean2 = args->err1_th_sse_d_mean2;
+    debug->err1_th_sse_d_mean = args->err1_th_sse_d_mean;
+    debug->err1_th_diff1 = args->err1_th_diff1;
+    debug->err1_th_diff2 = args->err1_th_diff2;
+    debug->err1_th_diff = args->err1_th_diff;
+    debug->err1_isfirst0 = args->err1_isfirst0;
+    debug->err1_isfirst1 = args->err1_isfirst1;
+    debug->err1_isfirst2 = args->err1_isfirst2;
+    debug->err1_n = args->err1_n;
+
+    /*
+     * ── STAGE 3: Contact Quality Assessment ──
+     *
+     * Binary ref: lines 3608-3815 (0x69220-0x69480)
+     *
+     * Compare SSE mean against multiple thresholds from dev_info:
+     *   - err1_th_sse_dmean[0] (at dev_info+0x438 in binary)
+     *   - err1_th_sse_dmean[1] (at dev_info+0x440)
+     *   - err1_th_sse_dmean[2] (at dev_info+0x448)
+     *
+     * Compare current_avg_diff against dev_info->err1_current_avg_diff
+     * (at dev_info+0x468 in binary).
+     *
+     * The is_contact_bad flag is set if:
+     *   1. SSE mean exceeds thresholds in a specific pattern, AND
+     *   2. Current avg diff exceeds its threshold
+     *
+     * Binary ref: line 3707 (0x69340): strb r0, [r6, #0x7c9]
+     *   Stores is_contact_bad to debug struct.
+     *
+     * TODO: The exact multi-threshold comparison logic from the binary
+     * is complex (lines 3608-3700). The thresholds are checked in
+     * cascade: if SSE < th0, use config A; elif SSE < th1, use B; etc.
+     * Oracle verification will confirm the exact conditions.
+     */
+
+    /* Determine the SSE threshold to use based on SSE magnitude */
+    double sse_threshold;
+    if (sse_d_mean < th_sse_dmean0) {
+        sse_threshold = th_sse_dmean0;
+    } else if (sse_d_mean < th_sse_dmean1) {
+        sse_threshold = th_sse_dmean1;
+    } else {
+        sse_threshold = th_sse_dmean2;
+    }
+
+    /* Check contact quality: current_avg_diff vs threshold */
+    if (current_avg_diff > current_avg_diff_threshold) {
+        is_contact_bad = 1;
+    }
+
+    /*
+     * Additional SSE-based contact check:
+     *
+     * Binary ref: lines 3690-3707 (0x69324-0x69340)
+     *   The binary counts how many entries in the is_contact_bad1h[100]
+     *   and i_sse_d_mean4h[100] history arrays exceed thresholds, then
+     *   sets is_contact_bad if the count exceeds err1_n_consecutive.
+     *
+     * TODO: Exact counting logic needs oracle verification.
+     */
+    uint8_t sse_bad_count = 0;
+    for (int i = 0; i < 100; i++) {
+        if (args->err1_i_sse_d_mean4h[i] > sse_threshold &&
+            !isnan(args->err1_i_sse_d_mean4h[i])) {
+            sse_bad_count++;
+        }
+    }
+
+    uint8_t contact_bad_1h_count = 0;
+    for (int i = 0; i < 100; i++) {
+        if (args->err1_is_contact_bad1h[i] != 0) {
+            contact_bad_1h_count++;
+        }
+    }
+
+    /* Combined contact quality evaluation */
+    uint8_t n_consecutive = dev_info->err1_n_consecutive;
+    if (sse_bad_count >= n_consecutive) {
+        is_contact_bad = 1;
+    }
+
+    /*
+     * Check SSE against err1_i_sse_dmean_now thresholds:
+     *
+     * Binary ref: lines ~3638-3650
+     * If the current SSE mean exceeds err1_i_sse_dmean_now[0] or [1],
+     * this also contributes to contact bad assessment.
+     */
+    if (sse_d_mean > (double)dev_info->err1_i_sse_dmean_now[0] &&
+        sse_d_mean > (double)dev_info->err1_i_sse_dmean_now[1]) {
+        if (contact_bad_1h_count >= dev_info->err1_count_sse_dmean) {
+            is_contact_bad = 1;
+        }
+    }
+
+    debug->err1_is_contact_bad = is_contact_bad;
+
+    /*
+     * Binary ref: lines 3815-3869 (0x69480-0x6952a)
+     * STAGE 3b: Update 100-element history arrays
+     *
+     * Shift the three 100-element history arrays left by 1:
+     *   err1_is_contact_bad1h[100]
+     *   err1_i_sse_d_mean4h[100]
+     *   err1_current_avg_diff_prev[100]
+     *
+     * Then append current values to position [99].
+     *
+     * Binary ref: lines 3816-3832 (0x69484-0x694b2)
+     *   Uses interleaved loop copying from args+0x4fc8 / args+0x4c39
+     *   which correspond to the packed history arrays.
+     */
+    memmove(args->err1_is_contact_bad1h,
+            args->err1_is_contact_bad1h + 1,
+            99 * sizeof(uint8_t));
+    args->err1_is_contact_bad1h[99] = is_contact_bad;
+
+    memmove(args->err1_i_sse_d_mean4h,
+            args->err1_i_sse_d_mean4h + 1,
+            99 * sizeof(double));
+    args->err1_i_sse_d_mean4h[99] = sse_d_mean;
+
+    memmove(args->err1_current_avg_diff_prev,
+            args->err1_current_avg_diff_prev + 1,
+            99 * sizeof(double));
+    args->err1_current_avg_diff_prev[99] = current_avg_diff;
+
+    /* Update previous last current value */
+    args->err1_prev_last_1min_curr = curr_avg_now;
+
+    /*
+     * ── Check for random noise / temporary break ──
+     *
+     * Binary ref: lines 3812-3815 (0x69478-0x69484)
+     *   If all 100 entries in err1_i_sse_d_mean4h exceed the
+     *   err1_current_avg_diff threshold from dev_info, then
+     *   err1_random_noise_temp_break = 1.
+     *
+     * This checks if there's a persistent pattern of noise.
+     */
+    uint8_t all_exceed = 1;
+    for (int i = 0; i < 100; i++) {
+        double val = args->err1_i_sse_d_mean4h[i];
+        if (isnan(val) || val < current_avg_diff_threshold) {
+            all_exceed = 0;
+            break;
+        }
+    }
+    if (all_exceed && seq_val >= err1_seq1) {
+        debug->err1_random_noise_temp_break = 1;
+    }
+
+    /*
+     * ── STAGE 4: Signal History Update (180-element arrays) ──
+     *
+     * Binary ref: lines 3839-3869 (0x694b4-0x6952a)
+     *
+     * Shift err1_SG_1min[180], err1_time_1min[180], err1_inA_1min[180]
+     * left by 1 position and append current values.
+     *
+     * These track 3-hour windows of signal/time/current values.
+     *
+     * TODO: Verify signal source. The binary copies from
+     * debug+0x5a0/0x7b0/0x7c0 areas. We use curr_avg_arr and
+     * measurement_time_standard as approximations.
+     */
+    memmove(args->err1_SG_1min,
+            args->err1_SG_1min + 1,
+            179 * sizeof(double));
+    args->err1_SG_1min[179] = curr_avg_now;
+
+    memmove(args->err1_time_1min,
+            args->err1_time_1min + 1,
+            179 * sizeof(uint32_t));
+    args->err1_time_1min[179] = debug->measurement_time_standard;
+
+    memmove(args->err1_inA_1min,
+            args->err1_inA_1min + 1,
+            179 * sizeof(double));
+    /* inA_1min stores tran_inA_1min[0] from the debug output */
+    args->err1_inA_1min[179] = debug->tran_inA_1min[0];
+
+    /*
+     * ── Check if enough data for TD processing ──
+     *
+     * Binary ref: lines 6727-6732 (0x6b69a-0x6b6aa)
+     *   r0 = uxth(r10)   ; count
+     *   cmp r0, #2
+     *   blo 0x69502       ; if count < 2, skip TD section
+     *
+     * The "count" (total_count / r10 / sp+0x196) represents the number
+     * of valid data segments available for TD analysis. If < 2, we
+     * cannot compute differences and skip the TD section entirely.
+     *
+     * We approximate total_count from the number of non-zero time entries.
+     */
+    uint16_t total_count = 0;
+    for (int i = 0; i < 180; i++) {
+        if (args->err1_time_1min[i] != 0) {
+            total_count++;
+        }
+    }
+
+    /* Store the count to debug fields before checking */
+    debug->err1_n = (uint16_t)total_count;
+
+    if (total_count < 2) {
+        /* Not enough data for TD processing */
+        goto final_decision;
+    }
+
+    /*
+     * ════════════════════════════════════════════════════════════════════
+     * STAGE 5: Temporal Discontinuity (TD) Detection
+     *
+     * Binary ref: lines 6733-7997 (0x6b6ae-0x6c5c4)
+     *
+     * This is the most complex part of err1. It uses 7 independent
+     * err1_TD_trio_update calls to evaluate temporal patterns in the
+     * signal data. Each trio evaluation checks for "spike" patterns
+     * where the middle value differs significantly from its neighbors.
+     *
+     * The TD processing operates on stack-allocated arrays that mirror
+     * the persistent err1_TD_temporary_break_flag_past_range[36] state
+     * in the arguments struct.
+     *
+     * Terminology:
+     *   - "trio" = group of 3 consecutive values [prev, current, next]
+     *   - "break" = a trio where differences exceed threshold d8
+     *   - "TD var" = variance tracking across 90-element windows
+     * ════════════════════════════════════════════════════════════════════
+     */
+
+    /*
+     * ── err1_TD_var_update #1 (line 6748) ──
+     *
+     * Binary ref: 0x6b6dc: bl err1_TD_var_update
+     * Rotates the first set of 90-element variance arrays.
+     *
+     * The source arrays come from the signal history (SG_1min,
+     * time_1min) and the destination arrays are on the stack.
+     */
+
+    /* Build working arrays from the 180-element histories */
+    double   td_val[180];
+    uint32_t td_time[180];
+    double   td_inA[180];
+    memcpy(td_val,  args->err1_SG_1min,   180 * sizeof(double));
+    memcpy(td_time, args->err1_time_1min,  180 * sizeof(uint32_t));
+    memcpy(td_inA,  args->err1_inA_1min,   180 * sizeof(double));
+
+    /*
+     * ── Absolute-difference smoothing (lines 6750-6775) ──
+     *
+     * Binary ref: 0x6b6ea-0x6b738
+     * The binary computes |val[i+1] - val[i]| for 0x598/8 = 179
+     * elements, producing the smoothed difference array.
+     *
+     * This is already computed above in abs_diff_buf[].
+     */
+
+    /*
+     * ── Sequence-to-index mapping (lines 6776-6835) ──
+     *
+     * Binary ref: 0x6b73a-0x6b7e2
+     *
+     * The binary maps sequence indices into the time array (td_time)
+     * to find matching positions. It builds a unique-sorted index array
+     * and a count (var_count at sp+0x194, total_count at sp+0x196).
+     *
+     * This effectively compresses the 180-element window into only
+     * the elements that have valid, non-duplicate timestamps.
+     */
+
+    /* Build a compressed array of valid entries */
+    uint16_t valid_indices[180];
+    uint16_t n_valid = 0;
+    for (int i = 0; i < 180; i++) {
+        if (td_time[i] != 0) {
+            valid_indices[n_valid++] = (uint16_t)i;
+        }
+    }
+
+    /*
+     * Binary ref: line 6836 (0x6b7e4)
+     *   strb r1, [r6, #0x7f4]
+     *
+     * Stores the var_count to debug. In our mapping, this corresponds
+     * to debug->err1_length_t2_max.
+     *
+     * TODO: Verify exact debug field mapping with oracle testing.
+     */
+    debug->err1_length_t2_max = (uint8_t)(n_valid < 255 ? n_valid : 255);
+
+    /* If still < 2 valid entries, skip */
+    if (n_valid < 2) {
+        goto final_decision;
+    }
+
+    /*
+     * ── err1_TD_var_update #2 (line 6849) ──
+     *
+     * Binary ref: 0x6b80e: bl err1_TD_var_update
+     * Second rotation of the variance arrays.
+     */
+
+    /*
+     * ── Build trio arrays for TD evaluation ──
+     *
+     * Binary ref: lines 6851-6932 (0x6b812-0x6b920)
+     *
+     * The binary builds arrays of (value, time, inA) triples from the
+     * compressed valid entries. These triples are organized into groups
+     * of 3 for the trio evaluation.
+     *
+     * For n valid entries, we get (n-1) consecutive pairs and
+     * (n-2) consecutive triples.
+     */
+
+    /* Build trio evaluation arrays: differences between consecutive valid points */
+    (void)0;  /* n_pairs = (n_valid - 1) implicitly used via n_trios */
+    uint16_t n_trios = (n_valid > 2) ? (n_valid - 2) : 0;
+
+    /* Allocate trio value arrays */
+    double trio_val[270];   /* max 90 trios * 3 values each */
+    uint32_t trio_time[270];
+    memset(trio_val, 0, sizeof(trio_val));
+    memset(trio_time, 0, sizeof(trio_time));
+
+    uint16_t trio_count = 0;
+    if (n_trios > 0 && n_trios <= 90) {
+        for (uint16_t i = 0; i < n_trios && i < 90; i++) {
+            uint16_t idx0 = valid_indices[i];
+            uint16_t idx1 = valid_indices[i + 1];
+            uint16_t idx2 = valid_indices[i + 2];
+
+            trio_val[i * 3 + 0] = td_val[idx0];
+            trio_val[i * 3 + 1] = td_val[idx1];
+            trio_val[i * 3 + 2] = td_val[idx2];
+
+            trio_time[i * 3 + 0] = td_time[idx0];
+            trio_time[i * 3 + 1] = td_time[idx1];
+            trio_time[i * 3 + 2] = td_time[idx2];
+        }
+        trio_count = (n_trios < 90) ? n_trios : 90;
+    }
+
+    /*
+     * ── TD Threshold (d8 in binary) ──
+     *
+     * Binary ref: line 6999-7000 (constant pool at 0x6b9d0)
+     *   .word 0x47ae147b, 0x3f947ae1
+     * This encodes the double 0.02 (2^-6 * 1.28 ~= 0.02).
+     * Actually: 0x3f947ae147ae147b = 0.02
+     *
+     * Wait, let me decode: 0x3f94 7ae1 47ae 147b
+     * But the pool has: 0x47ae147b (low word), 0x3f947ae1 (high word)
+     * So the double is 0x3F947AE147AE147B = 0.02
+     *
+     * The binary multiplies this by d9 (the SSE mean or current metric)
+     * to get the TD threshold d8.
+     *
+     * Binary ref: line 7001-7005 (0x6b9d8-0x6b9ea)
+     *   vldr d16, [pc, #-12]   ; d16 = 0.02
+     *   vmul d16, d9, d16      ; d8 = d9 * 0.02
+     *
+     * TODO: Verify the threshold computation. The exact source of d9
+     * at this point depends on the preceding cal_threshold results.
+     */
+    double td_threshold = sse_d_mean * 0.02;
+    if (td_threshold < 0.0001) {
+        td_threshold = th_diff_devinfo;
+    }
+
+    /*
+     * ── Trio Evaluation Loop 1 (pre-update, lines 6998-7060) ──
+     *
+     * Binary ref: 0x6b9d8-0x6ba9a
+     *
+     * For each trio (3 consecutive values), check:
+     *   |val[2] - val[1]| < threshold  (close values = continuity)
+     *   |val[0] - val[1]| < threshold  (consistent pattern)
+     *
+     * If BOTH differences are below threshold, this trio is "stable" and
+     * gets copied into the output array. Otherwise it's filtered out.
+     *
+     * The surviving trios and a count (trio_count) are passed to
+     * err1_TD_trio_update.
+     */
+
+    uint8_t trio_flags[90];
+    memset(trio_flags, 0, sizeof(trio_flags));
+
+    /* First trio filtering: check for stable trios */
+    (void)0;  /* stable_count tracked implicitly */
+    for (uint16_t i = 0; i < trio_count; i++) {
+        double v0 = trio_val[i * 3 + 0];
+        double v1 = trio_val[i * 3 + 1];
+        double v2 = trio_val[i * 3 + 2];
+
+        double diff_21 = fabs(v2 - v1);
+        double diff_01 = fabs(v0 - v1);
+
+        if (diff_21 < td_threshold && diff_01 < td_threshold) {
+            trio_flags[i] = 1;  /* stable trio */
+        }
+    }
+
+    /*
+     * ── err1_TD_trio_update #1 (line 7187) ──
+     *
+     * Binary ref: 0x6bc2c: bl err1_TD_trio_update
+     *
+     * The first trio_update call rotates the trio state arrays.
+     * Arguments are the stack-allocated trio arrays.
+     */
+
+    /* Use the persistent break_flag array from args */
+    uint8_t break_flags[36];
+    memcpy(break_flags, args->err1_TD_temporary_break_flag_past_range,
+           sizeof(break_flags));
+
+    /*
+     * ── Trio Evaluation Loops 2-7 ──
+     *
+     * Binary ref: lines 7187-7823 (0x6bc2c-0x6c3de)
+     *
+     * The binary performs 7 independent err1_TD_trio_update calls,
+     * each with different criteria for what constitutes a "break":
+     *
+     * Trio update 1 (line 7187): Basic trio evaluation
+     *   Checks |val[i-1] - val[i]| > d8 AND |val[i] - val[i+1]| < d8
+     *   AND |val[i-1] - val[i+1]| < d8
+     *   (spike at position i: differs from before but next returns)
+     *
+     * Trio update 2 (line 7275): Reversed direction spike
+     *   Checks |val[i] - val[i-1]| > d8 AND |val[i+1] - val[i]| > d8
+     *   AND both differ but val[i-1] ~= val[i+1]
+     *
+     * Trio update 3 (line 7372): Time-based evaluation
+     *   Checks time differences AND value differences exceed d8
+     *   Also checks that times[i] != times[i+1] (not same timestamp)
+     *
+     * Trio update 4 (line 7488): Additional pattern with time constraint
+     *
+     * Trio update 5 (line 7593): R-squared quality check
+     *   After the trio evaluation, performs fit_simple_regression + f_rsq
+     *   If R^2 < threshold, the trio is considered valid
+     *
+     * Trio update 6 (line 7712): Time-gap based evaluation
+     *
+     * Trio update 7 (line 7771): Combined absolute-difference check
+     *   Checks |val[1] - val[0]| >= threshold AND
+     *          |val[1] - val[2]| >= threshold
+     *
+     * Each evaluation produces:
+     *   - A count of "break" events (stored to corresponding debug field)
+     *   - Break flag indices (stored to break_flags)
+     *   - An updated trio count
+     *
+     * The debug fields err1_length_t{1-10}_trio record the counts from
+     * each evaluation.
+     *
+     * TODO: The exact criteria for each of the 7 trio evaluations need
+     * careful per-instruction verification. The patterns above are
+     * reconstructed from the ARM disassembly but may have subtle
+     * differences in comparison directions (>, >=, <, <=) and sign
+     * handling. Oracle testing will catch discrepancies.
+     */
+
+    /* Count various types of temporal discontinuities */
+    uint8_t td_break_count1 = 0;  /* spike: middle differs from neighbors */
+    uint8_t td_break_count2 = 0;  /* reversed spike */
+    uint8_t td_break_count3 = 0;  /* time-based */
+    uint8_t td_break_count4 = 0;  /* time-constrained */
+    uint8_t td_break_count5 = 0;  /* regression quality */
+    uint8_t td_break_count6 = 0;  /* time-gap */
+    uint8_t td_break_count7 = 0;  /* absolute difference */
+
+    /* The time divisor (d15) converts timestamp differences to minutes */
+    double time_divisor = 60.0;
+
+    /*
+     * Trio evaluation 1: Spike detection (middle differs from both neighbors)
+     *
+     * Binary ref: lines 7193-7215 (0x6bc42-0x6bc8c)
+     *   vldr d17, [r9, #-16]   ; val[i-1]
+     *   vldr d16, [r9, #-8]    ; val[i]
+     *   vsub d17, d17, d16     ; d17 = val[i-1] - val[i]
+     *   vcmp d17, d8           ; compare with threshold
+     *   ble skip               ; if <= threshold, not a spike
+     *   vldr d17, [r9]         ; val[i+1]
+     *   vsub d16, d17, d16     ; d16 = val[i+1] - val[i]
+     *   vcmp d16, d8
+     *   bpl skip               ; if >= threshold, not a return
+     *   vldr d16, [r9, #8]     ; val[i+2]
+     *   vsub d16, d16, d17     ; d16 = val[i+2] - val[i+1]
+     *   vcmp d16, d8
+     *   ittt gt                ; if > threshold:
+     *     store break index
+     *     increment count
+     *
+     * Pattern: val[i-1] significantly > val[i], val[i+1] returns close to
+     * val[i-1], val[i+2] continues the trend => spike at val[i].
+     */
+    for (uint16_t i = 0; i + 2 < trio_count; i++) {
+        double v0 = trio_val[i * 3 + 0];
+        double v1 = trio_val[i * 3 + 1];
+        double v2 = trio_val[i * 3 + 2];
+
+        /* Check for spike pattern: v0-v1 > th, v1-v2 < -th (opposite sign) */
+        if ((v0 - v1) > td_threshold &&
+            (v2 - v1) > td_threshold &&
+            fabs(v2 - v0) > td_threshold) {
+            td_break_count1++;
+        }
+    }
+
+    /*
+     * Trio evaluation 2: Time-differentiated discontinuity
+     *
+     * Binary ref: lines 7275-7313 (0x6bd3a-0x6bdba)
+     *   Uses trio values AND time arrays. Checks that:
+     *   |val[i] - val[i+1]| > threshold AND
+     *   |val[i+1] - val[i+2]| > abs(threshold) (with sign check) AND
+     *   time[i] != time[i+1] (different measurement times)
+     */
+    for (uint16_t i = 1; i < trio_count; i++) {
+        double v0 = trio_val[i * 3 + 0];  /* prev */
+        double v1 = trio_val[i * 3 + 1];  /* current */
+        double v2 = trio_val[i * 3 + 2];  /* next */
+
+        double d01 = v0 - v1;
+        double d12 = v1 - v2;
+
+        if (d01 > td_threshold) {
+            if (fabs(d12) > td_threshold) {
+                double d02 = v2 - v0;
+                if (d02 > td_threshold) {
+                    uint32_t t0 = trio_time[i * 3 + 0];
+                    uint32_t t1 = trio_time[i * 3 + 1];
+                    if (t0 != t1) {
+                        td_break_count2++;
+                    }
+                }
+            }
+        }
+    }
+
+    /*
+     * Trio evaluation 3: Time-gap equal pattern
+     *
+     * Binary ref: lines 7372-7388 (0x6be6a-0x6be98)
+     *   Checks time[i] == time[i+1] (same timestamp entries) and
+     *   if so, marks as a break.
+     */
+    for (uint16_t i = 0; i < trio_count; i++) {
+        uint32_t t0 = trio_time[i * 3 + 0];
+        uint32_t t1 = trio_time[i * 3 + 1];
+        if (t0 == t1 && t0 != 0) {
+            td_break_count3++;
+        }
+    }
+
+    /*
+     * Trio evaluation 4: Combined regression analysis
+     *
+     * Binary ref: lines 7488-7569 (0x6bfba-0x6c0ba)
+     *
+     * This evaluation uses fit_simple_regression + f_rsq to check
+     * the quality of the trio fits. For each group of 3 consecutive
+     * trios, fit a regression line. If R^2 is below a threshold
+     * (loaded from stack constant at sp+0x180), the group has poor
+     * linearity and indicates a discontinuity.
+     *
+     * Binary ref: lines 7527-7538 (0x6c038-0x6c050)
+     *   bl fit_simple_regression  ; fit line to 3 points
+     *   bl f_rsq                  ; compute R^2
+     *   vldr d16, [sp, #384]      ; load R^2 threshold
+     *   vcmp d0, d16              ; compare R^2 vs threshold
+     *   bpl skip                  ; if R^2 >= threshold, skip
+     *
+     * The R^2 threshold is loaded from sp+0x180, which is a stack
+     * variable set earlier (TODO: determine exact value).
+     */
+    double rsq_threshold = 0.5;  /* TODO: Verify R^2 threshold from binary */
+
+    if (trio_count >= 3) {
+        /* Prepare arrays for regression on trio midpoints */
+        double reg_x[3];
+        double reg_y[3];
+        double reg_result[2];  /* [slope, intercept] */
+
+        for (uint16_t i = 0; i + 2 < trio_count; i++) {
+            /* Use 3 consecutive trio midpoints */
+            for (int j = 0; j < 3; j++) {
+                uint32_t t = trio_time[(i + j) * 3 + 1];
+                uint32_t t_base = trio_time[i * 3 + 1];
+                reg_x[j] = (double)(t - t_base) / time_divisor;
+                reg_y[j] = trio_val[(i + j) * 3 + 1];
+            }
+
+            fit_simple_regression(reg_x, reg_y, 3, reg_result);
+            double rsq = f_rsq(reg_result, reg_y, reg_x, 3);
+
+            if (!isnan(rsq) && rsq < rsq_threshold) {
+                td_break_count4++;
+            }
+        }
+    }
+
+    /*
+     * Trio evaluation 5: Time-normalized difference
+     *
+     * Binary ref: lines 7593-7666 (0x6c0bc-0x6c1f0)
+     *
+     * Checks time differences normalized by 60 seconds. If the
+     * time gap between entries exceeds a threshold (20.1 from the
+     * constant pool at 0x6c4c0: 0x40341999 9999999a = 20.1),
+     * the pair is considered a break.
+     *
+     * Also checks if consecutive time entries are identical and
+     * the gap to the next is > 20.1 minutes.
+     */
+    double time_gap_threshold = 20.1;  /* From constant pool at 0x6c4c0 */
+
+    for (uint16_t i = 0; i + 1 < trio_count; i++) {
+        uint32_t t0 = trio_time[i * 3 + 1];
+        uint32_t t1 = trio_time[i * 3 + 2];
+        uint32_t t2 = trio_time[(i + 1) * 3 + 2];
+
+        if (t1 == t2 && t1 != 0) {
+            double gap = (double)(t2 - t0) / time_divisor;
+            if (gap < time_gap_threshold) {
+                td_break_count5++;
+            }
+        }
+    }
+
+    /*
+     * Trio evaluation 6: Large absolute difference
+     *
+     * Binary ref: lines 7771-7822 (0x6c332-0x6c3dc)
+     *
+     * Checks |val[1] - val[0]| >= threshold AND |val[1] - val[2]| >= threshold.
+     * Uses a different threshold from sp+0x17c (another constant).
+     *
+     * The threshold is loaded from sp+0x178 (constant pool at sp+376):
+     * Decoded as d19 in the binary.
+     *
+     * TODO: Determine exact threshold value.
+     */
+    double td_threshold_large = td_threshold * 5.0;
+    /* TODO: Verify multiplier with oracle testing */
+
+    for (uint16_t i = 0; i < trio_count; i++) {
+        double v0 = trio_val[i * 3 + 0];
+        double v1 = trio_val[i * 3 + 1];
+        double v2 = trio_val[i * 3 + 2];
+
+        double d10 = fabs(v1 - v0);
+        double d12 = fabs(v1 - v2);
+
+        if (d10 >= td_threshold_large && d12 >= td_threshold_large) {
+            td_break_count6++;
+        }
+    }
+
+    /*
+     * Trio evaluation 7: Sorted break-flag deduplication
+     *
+     * Binary ref: lines 7823-7909 (0x6c3de-0x6c4d4)
+     *
+     * The binary performs a bubble-sort of the break indices collected
+     * from all previous trio evaluations (stored in a 90-element
+     * uint8_t array). Then it deduplicates and builds a final list
+     * of unique break positions.
+     *
+     * This is used for the final TD count and the regression-based
+     * quality check on the unique break positions.
+     *
+     * The output count (r8 at line 7913) is stored to debug->err1_result_TD.
+     */
+
+    /* Combine all break counts */
+    total_breaks = (uint16_t)(td_break_count1 + td_break_count2 +
+                              td_break_count3 + td_break_count4 +
+                              td_break_count5 + td_break_count6 +
+                              td_break_count7);
+
+    /* Store individual trio counts to debug */
+    debug->err1_length_t1_trio = td_break_count1;
+    debug->err1_length_t2_trio = td_break_count2;
+    debug->err1_length_t3_trio = td_break_count3;
+    debug->err1_length_t6_trio = td_break_count4;
+    debug->err1_length_t7_trio = td_break_count5;
+    debug->err1_length_t8_trio = td_break_count6;
+    debug->err1_length_t9_trio = td_break_count7;
+    debug->err1_length_t3_max = (uint8_t)(total_breaks < 255 ? total_breaks : 255);
+
+    /* Store combined result TD */
+    uint8_t result_TD = (total_breaks > 0) ? 1 : 0;
+    debug->err1_result_TD = result_TD;
+    debug->err1_TD_count = total_breaks;
+
+    /*
+     * ── Final TD value/time trio storage ──
+     *
+     * Binary ref: lines 7910-7932 (0x6c4d6-0x6c51c)
+     *
+     * If result_TD != 0, the binary stores the last trio's values
+     * and times into debug->err1_TD_value_trio[3] and
+     * debug->err1_TD_time_trio[3]. These represent the most recent
+     * temporal discontinuity found.
+     */
+    if (result_TD && trio_count > 0) {
+        uint16_t last_trio = trio_count - 1;
+        for (int j = 0; j < 3; j++) {
+            debug->err1_TD_time_trio[j] = trio_time[last_trio * 3 + j];
+            debug->err1_TD_value_trio[j] = trio_val[last_trio * 3 + j];
+        }
+    }
+
+    /*
+     * ── STAGE 5b: Update persistent TD state ──
+     *
+     * Binary ref: lines 7935-7942 (0x6c51e-0x6c530)
+     *
+     * Update err1_sum_result_condition_TD (args->err1_sum_result_condition_TD)
+     * and err1_any_result_condition_TD.
+     *
+     * The binary checks dev_info->err1_n_last against the total breaks
+     * count and updates the condition flags.
+     *
+     * Binary ref: lines 7935-7942 (0x6c51e-0x6c530)
+     *   ldr r0, [sp, #0xf4]           ; dev_info
+     *   ldrh r0, [r0, #0x4bc]         ; err1_n_last
+     *   cmp r0, r10                    ; compare n_last vs total breaks
+     *   blo ...                        ; if n_last < breaks, condition met
+     *   ldr r0, [sp, #0x9c]           ; args
+     *   ldrb r0, [r0, #0xe3c]         ; err1_result_prev
+     *   cmp r0, #0                     ; if prev_result == 0
+     *   beq skip                       ; skip if no previous error
+     */
+    uint8_t td_condition = 0;
+
+    if (total_breaks > n_last_threshold) {
+        td_condition = 1;
+    } else if (args->err1_result_prev != 0) {
+        td_condition = 1;
+    }
+
+    /*
+     * Binary ref: lines 7943-7970 (0x6c532-0x6c580)
+     *
+     * Additional conditions based on n_last threshold comparisons:
+     *   If total_breaks == n_last AND prev_result:
+     *     Check break_flag history (36-element array)
+     *     Sum break flags; if sum < err1_th_n1[2], condition = 1
+     *
+     *   If total_breaks <= 4 AND prev_result == 1:
+     *     Check break_flag_past_range[36] sum against threshold
+     *     err1_result_condition_TD[0] = (sum < threshold) ? 1 : 0
+     *
+     *   If total_breaks > n_last:
+     *     err1_sum_result_condition_TD += 1
+     *     If sum_result >= 2: err1_any_result_condition_TD = 1
+     */
+    if (td_condition) {
+        /* Check the break flag history */
+        uint16_t break_flag_sum = 0;
+        for (int i = 0; i < 36; i++) {
+            break_flag_sum += args->err1_TD_temporary_break_flag_past_range[i];
+        }
+
+        uint8_t th_n1_val = dev_info->err1_th_n1[2];
+        if (break_flag_sum < th_n1_val) {
+            result_condition_TD0 = 1;
+        }
+
+        /*
+         * Check with n_last exact match
+         *
+         * Binary ref: lines 7943-7949 (0x6c532-0x6c544)
+         */
+        if (total_breaks == n_last_threshold && args->err1_result_prev != 0) {
+            result_condition_TD1 = 1;
+        }
+    }
+
+    /*
+     * Binary ref: lines 7951-7973 (0x6c548-0x6c580)
+     *
+     * If total_breaks <= 4 AND prev_result == 1:
+     *   Iterate through break_flag_past_range, summing all bytes (36 entries)
+     *   Compare sum against dev_info->err1_th_n1[2]
+     *   If sum < threshold: set result_condition_TD[1] = 1
+     *
+     * If total_breaks > err1_n_last:
+     *   Store 0x101 (257) to err1_sum_result_condition_TD
+     */
+    if (total_breaks <= 4 && args->err1_result_prev == 1) {
+        uint16_t flag_sum = 0;
+        for (int i = 0; i < 36; i++) {
+            flag_sum += args->err1_TD_temporary_break_flag_past_range[i];
+        }
+        if (flag_sum < dev_info->err1_th_n1[2]) {
+            result_condition_TD1 = 1;
+        }
+    }
+
+    if (total_breaks > n_last_threshold) {
+        args->err1_sum_result_condition_TD += 1;
+        if (args->err1_sum_result_condition_TD >= 2) {
+            args->err1_any_result_condition_TD = 1;
+        }
+    }
+
+    debug->err1_result_condition_TD[0] = result_condition_TD0;
+    debug->err1_result_condition_TD[1] = result_condition_TD1;
+
+    /*
+     * ── Update break flag history ──
+     *
+     * Binary ref: lines 6860-6868 (shift pattern for TD_temporary_break_flag_past_range)
+     *
+     * Shift the 36-element break flag array left by 1 and append
+     * the current break status.
+     */
+    memmove(args->err1_TD_temporary_break_flag_past_range,
+            args->err1_TD_temporary_break_flag_past_range + 1,
+            35 * sizeof(uint8_t));
+    args->err1_TD_temporary_break_flag_past_range[35] =
+        (total_breaks > 0) ? 1 : 0;
+
+    debug->err1_TD_temporary_break_flag = (total_breaks > 0) ? 1 : 0;
+
+    /*
+     * ════════════════════════════════════════════════════════════════════
+     * STAGE 6: Final Decision
+     *
+     * Binary ref: lines 7983-7997 (0x6c59c-0x6c5c4)
+     *
+     * The final error code is determined by combining:
+     *   1. Contact quality (is_contact_bad)
+     *   2. TD results (result_TD, result_condition_TD)
+     *   3. Hysteresis from err1_result_prev
+     *
+     * Binary decision logic (0x6c59c-0x6c5b8):
+     *   If is_contact_bad == 1 AND
+     *      (result_condition_TD[0] == 1 OR result_condition_TD[1] == 1
+     *       OR total_breaks > n_last):
+     *     error_code1 = 1
+     *     is_contact_bad = 1 (confirm in debug)
+     *     sum_result_condition_TD += 1
+     *     if (sum_result >= 2): err1_any_result_condition_TD = 1
+     *   Else if prev_result == 1 AND seq_val >= err1_seq[2]:
+     *     error_code1 = 1  (hysteresis: latch previous error)
+     *   Else:
+     *     error_code1 = 0
+     *
+     * Binary ref: line 7986 (0x6c5a0): strb r0, [r6, #0x7f0]
+     *   Stores final error_code1 to debug->error_code1.
+     *
+     * TODO: The exact condition evaluation order may differ from the
+     * binary. Oracle testing will validate the final decision logic.
+     * ════════════════════════════════════════════════════════════════════
+     */
+
+final_decision:
+    ;  /* C requires a statement after label */
+
+    uint8_t final_result = 0;
+
+    if (is_contact_bad) {
+        /* Contact is bad — check if TD conditions also indicate error */
+        if (result_condition_TD0 || result_condition_TD1 ||
+            total_breaks > n_last_threshold) {
+            final_result = 1;
+        }
+    }
+
+    /* Hysteresis: if previous result was 1, latch unless conditions clear */
+    if (args->err1_result_prev == 1 && seq_val >= err1_seq2) {
+        if (args->err1_sum_result_condition_TD >= 2) {
+            final_result = 1;
+        }
+    }
+
+    debug->error_code1 = final_result;
+    debug->err1_result = final_result;
+
+    /*
+     * ── EPILOGUE: Update persistent state ──
+     *
+     * Binary ref: lines 7986-7994 (0x6c5a0-0x6c5b8)
+     *
+     * Store final result to args for next iteration's hysteresis.
+     * Update err1_any_result_condition_TD if conditions met.
+     */
+epilogue:
+    args->err1_result_prev = debug->error_code1;
+
+    /* Store updated debug state */
+    debug->err1_is_contact_bad = is_contact_bad;
 }
 
 /* ────────────────────────────────────────────────────────────────────

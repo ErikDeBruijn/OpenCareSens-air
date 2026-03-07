@@ -81,7 +81,14 @@ static void test_err32_all_flags_zero(void)
     struct air1_opcal4_device_info_t *dev = alloc_dev_info();
     struct air1_opcal4_debug_t *dbg = alloc_debug();
 
-    /* All debug fields zeroed by calloc */
+    /*
+     * Force err1 to take its early-exit path so it does not produce
+     * side-effects (random_noise_temp_break=1 from all-zero inputs).
+     * With all-zero data, the binary also sets that flag because 0.0 >= 0.0
+     * passes its threshold check for all 100 history entries.
+     */
+    dev->err1_seq[0] = 255;
+
     check_error(args, dev, dbg, 100, 5.0);
 
     ASSERT_EQ(dbg->error_code32, 0);
@@ -176,6 +183,13 @@ static void test_err32_nonone_values(void)
     struct air1_opcal4_arguments_t *args = alloc_args();
     struct air1_opcal4_device_info_t *dev = alloc_dev_info();
     struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    /*
+     * Force err1 early exit so it doesn't overwrite the pre-set flags.
+     * Without this, err1 re-initializes err1_is_contact_bad and
+     * err1_random_noise_temp_break, clobbering the test setup.
+     */
+    dev->err1_seq[0] = 255;
 
     /* The binary checks cmp r0, #1 exactly, not just nonzero */
     dbg->err4_delay_flag = 2;
@@ -760,6 +774,9 @@ static void test_err4_min_tracking_seq1(void)
     struct air1_opcal4_device_info_t *dev = alloc_dev_info();
     struct air1_opcal4_debug_t *dbg = alloc_debug();
 
+    /* Force err1 early exit so it doesn't overwrite err1_i_sse_d_mean */
+    dev->err1_seq[0] = 255;
+
     dbg->err1_i_sse_d_mean = 42.5;
     dev->err345_seq4[0] = 10;
     dev->err345_seq4[1] = 20;
@@ -781,6 +798,9 @@ static void test_err4_min_tracking_updates(void)
     struct air1_opcal4_arguments_t *args = alloc_args();
     struct air1_opcal4_device_info_t *dev = alloc_dev_info();
     struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    /* Force err1 early exit so it doesn't overwrite err1_i_sse_d_mean */
+    dev->err1_seq[0] = 255;
 
     /* Previous min was 50.0, current value is 30.0 */
     args->err4_min_prev[0] = 50.0;
@@ -806,6 +826,9 @@ static void test_err4_min_prev_shifts(void)
     struct air1_opcal4_arguments_t *args = alloc_args();
     struct air1_opcal4_device_info_t *dev = alloc_dev_info();
     struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    /* Force err1 early exit so it doesn't overwrite err1_i_sse_d_mean */
+    dev->err1_seq[0] = 255;
 
     args->err4_min_prev[0] = 10.0;
     args->err4_min_prev[1] = 20.0;
@@ -925,6 +948,9 @@ static void test_err4_range_computed_for_seq_gte_2(void)
     struct air1_opcal4_device_info_t *dev = alloc_dev_info();
     struct air1_opcal4_debug_t *dbg = alloc_debug();
 
+    /* Force err1 early exit so it doesn't overwrite err1_i_sse_d_mean */
+    dev->err1_seq[0] = 255;
+
     dbg->err1_i_sse_d_mean = 100.0;
     args->err4_min_prev[0] = 80.0;
     args->err4_min_prev[1] = 60.0;
@@ -950,6 +976,9 @@ static void test_err4_nan_in_prev_min(void)
     struct air1_opcal4_arguments_t *args = alloc_args();
     struct air1_opcal4_device_info_t *dev = alloc_dev_info();
     struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    /* Force err1 early exit so it doesn't overwrite err1_i_sse_d_mean */
+    dev->err1_seq[0] = 255;
 
     dbg->err1_i_sse_d_mean = 50.0;
     args->err4_min_prev[0] = NAN;
@@ -1926,6 +1955,467 @@ static void test_err16_multiple_seq_calls_stable(void)
 }
 
 /* ════════════════════════════════════════════════════════════════════
+ * err1 tests (contact/noise error)
+ * ════════════════════════════════════════════════════════════════════ */
+
+/*
+ * Helper: configure dev_info so err1 is active but other detectors
+ * don't produce side effects. Sets err1_seq[0]=1 (minimum threshold),
+ * and reasonable err8 thresholds.
+ */
+static void setup_err1_dev_info(struct air1_opcal4_device_info_t *dev)
+{
+    dev->err1_seq[0] = 1;   /* err1 active for idx >= 1 */
+    dev->err1_seq[1] = 1;
+    dev->err1_seq[2] = 1;
+    dev->err1_n_consecutive = 200;   /* high threshold to avoid vacuous SSE check */
+    dev->err1_count_sse_dmean = 200; /* high threshold for contact bad 1h count */
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+}
+
+static void test_err1_early_exit_low_seq(void)
+{
+    TEST("err1: idx < err1_seq[0] -> early exit, error_code1 = 0");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_seq[0] = 10;  /* threshold = 10 */
+    args->idx = 5;           /* below threshold */
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    ASSERT_EQ(dbg->error_code1, 0);
+    ASSERT_EQ(dbg->err1_is_contact_bad, 0);
+    ASSERT_EQ(dbg->err1_random_noise_temp_break, 0);
+    ASSERT_EQ(dbg->err1_result, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_early_exit_preserves_prev_fields(void)
+{
+    TEST("err1: early exit preserves err1_i_sse_d_mean from prior");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_seq[0] = 255;  /* force early exit */
+
+    /* Pre-set a debug value that should survive early exit */
+    dbg->err1_i_sse_d_mean = 42.0;
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    /* Early exit should NOT overwrite err1_i_sse_d_mean */
+    ASSERT_DOUBLE_EQ(dbg->err1_i_sse_d_mean, 42.0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_initializes_debug_on_main_path(void)
+{
+    TEST("err1: main path initializes debug fields to defaults");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    /* Set high thresholds so err1 doesn't trigger errors */
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+    dev->err1_th_sse_dmean[1] = 2000;
+    dev->err1_th_sse_dmean[2] = 3000;
+
+    args->idx = 5;  /* above threshold of 1 */
+
+    /* Pre-set fields that err1 should overwrite */
+    dbg->err1_result_TD = 99;
+    dbg->err1_TD_count = 99;
+    dbg->err1_length_t1_trio = 99;
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    /* Main path should have reset these */
+    ASSERT_EQ(dbg->err1_result_TD, 0);
+    ASSERT_EQ(dbg->err1_TD_count, 0);
+    ASSERT_EQ(dbg->err1_length_t1_trio, 0);
+    ASSERT_EQ(dbg->error_code1, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_sse_d_mean_computed(void)
+{
+    TEST("err1: sse_d_mean computed from curr_avg_arr differences");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+    dev->err1_th_sse_dmean[1] = 2000;
+    dev->err1_th_sse_dmean[2] = 3000;
+
+    args->idx = 5;
+
+    /* Set up a simple pattern: [10, 20, 30, ...] so abs diffs are all 10.0 */
+    for (int i = 0; i < 180; i++) {
+        args->curr_avg_arr[i] = 10.0 * (i + 1);
+    }
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    /* SSE mean should be 10.0 (all differences are 10.0) */
+    ASSERT_DOUBLE_EQ(dbg->err1_i_sse_d_mean, 10.0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_sse_d_mean_zero_for_constant(void)
+{
+    TEST("err1: constant curr_avg_arr -> sse_d_mean = 0.0");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+
+    args->idx = 5;
+
+    /* Constant values: all differences are 0 */
+    for (int i = 0; i < 180; i++) {
+        args->curr_avg_arr[i] = 100.0;
+    }
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    /* All diffs are 0, none are > 0, so sse_d_mean stays 0.0 */
+    ASSERT_DOUBLE_EQ(dbg->err1_i_sse_d_mean, 0.0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_contact_bad_from_avg_diff(void)
+{
+    TEST("err1: large current_avg_diff -> is_contact_bad = 1");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    /* Set a low threshold for current_avg_diff so contact is marked bad */
+    dev->err1_current_avg_diff = 5;
+    dev->err1_th_sse_dmean[0] = 1000;
+    dev->err1_th_sse_dmean[1] = 2000;
+    dev->err1_th_sse_dmean[2] = 3000;
+
+    args->idx = 5;
+
+    /*
+     * curr_avg_now = curr_avg_arr[idx-1] = curr_avg_arr[4]
+     * curr_avg_prev = args->err1_prev_last_1min_curr
+     * current_avg_diff = |curr_avg_now - curr_avg_prev|
+     */
+    args->curr_avg_arr[4] = 100.0;
+    args->err1_prev_last_1min_curr = 50.0;
+    /* diff = |100 - 50| = 50, threshold = 5 -> bad */
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    ASSERT_EQ(dbg->err1_is_contact_bad, 1);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_contact_good_below_threshold(void)
+{
+    TEST("err1: small current_avg_diff -> is_contact_bad = 0");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 100;  /* high threshold */
+    dev->err1_th_sse_dmean[0] = 1000;
+    dev->err1_n_consecutive = 200;     /* high SSE bad count threshold */
+    dev->err1_count_sse_dmean = 200;   /* high contact bad 1h threshold */
+
+    args->idx = 5;
+
+    args->curr_avg_arr[4] = 50.0;
+    args->err1_prev_last_1min_curr = 48.0;
+    /* diff = |50 - 48| = 2, threshold = 100 -> good */
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    ASSERT_EQ(dbg->err1_is_contact_bad, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_history_100_shifts_left(void)
+{
+    TEST("err1: 100-element history arrays shift left by 1");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+    dev->err1_n_consecutive = 200;
+    dev->err1_count_sse_dmean = 200;
+
+    args->idx = 5;
+
+    /* Set recognizable pattern in is_contact_bad1h */
+    args->err1_is_contact_bad1h[0] = 10;
+    args->err1_is_contact_bad1h[1] = 20;
+    args->err1_is_contact_bad1h[99] = 99;
+
+    /* Set pattern in i_sse_d_mean4h */
+    args->err1_i_sse_d_mean4h[0] = 100.0;
+    args->err1_i_sse_d_mean4h[1] = 200.0;
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    /* After shift: [0] should be old [1] */
+    ASSERT_EQ(args->err1_is_contact_bad1h[0], 20);
+    ASSERT_DOUBLE_EQ(args->err1_i_sse_d_mean4h[0], 200.0);
+    /* [99] should be the new value (is_contact_bad=0 with high threshold) */
+    ASSERT_EQ(args->err1_is_contact_bad1h[99], 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_signal_180_shifts_left(void)
+{
+    TEST("err1: 180-element signal histories shift left by 1");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+
+    args->idx = 5;
+
+    /* Set recognizable pattern */
+    args->err1_SG_1min[0] = 1.0;
+    args->err1_SG_1min[1] = 2.0;
+    args->err1_SG_1min[179] = 99.0;
+
+    args->err1_time_1min[0] = 100;
+    args->err1_time_1min[1] = 200;
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    /* After shift: [0] = old [1] */
+    ASSERT_DOUBLE_EQ(args->err1_SG_1min[0], 2.0);
+    ASSERT_EQ(args->err1_time_1min[0], 200);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_random_noise_break_all_zero_threshold(void)
+{
+    TEST("err1: all-zero data with zero threshold -> temp_break = 1");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    /*
+     * With all-zero structs (except err1_seq[0]=0 so not early exit),
+     * the binary sets random_noise_temp_break=1 because:
+     *   - All i_sse_d_mean4h entries are 0.0
+     *   - Threshold is 0.0
+     *   - 0.0 >= 0.0 is true for all 100 entries (they don't fail
+     *     the val < threshold check)
+     *   - seq_val (0) >= err1_seq[1] (0) is true
+     */
+    /* Don't call setup_err1_dev_info, leave all zeros */
+    dev->err345_seq4[0] = 10;
+    dev->err345_seq4[1] = 20;
+    dev->err345_seq4[2] = 5;
+    dev->err345_filtered[0] = 1.0f;
+    dev->err345_filtered[1] = 50.0f;
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    ASSERT_EQ(dbg->err1_random_noise_temp_break, 1);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_random_noise_break_high_threshold(void)
+{
+    TEST("err1: high threshold -> temp_break = 0");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    /* High current_avg_diff threshold means 0.0 < 1000 will cause
+     * the all_exceed loop to fail immediately */
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+
+    args->idx = 5;
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    ASSERT_EQ(dbg->err1_random_noise_temp_break, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_td_skipped_insufficient_time_data(void)
+{
+    TEST("err1: no time entries -> TD processing skipped, result_TD=0");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+
+    args->idx = 5;
+    /* All time entries are 0 (calloc) -> total_count = 0 < 2 */
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    ASSERT_EQ(dbg->err1_result_TD, 0);
+    ASSERT_EQ(dbg->err1_TD_count, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_epilogue_stores_result_prev(void)
+{
+    TEST("err1: epilogue stores error_code1 into args->err1_result_prev");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+
+    args->idx = 5;
+
+    /* With high thresholds, error_code1 should be 0 */
+    check_error(args, dev, dbg, 50, 5.0);
+
+    ASSERT_EQ(args->err1_result_prev, 0);
+    ASSERT_EQ(dbg->error_code1, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_prev_last_1min_curr_updated(void)
+{
+    TEST("err1: err1_prev_last_1min_curr updated to curr_avg_arr[idx-1]");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+
+    args->idx = 10;
+    args->curr_avg_arr[9] = 77.5;  /* idx-1 = 9 */
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    ASSERT_DOUBLE_EQ(args->err1_prev_last_1min_curr, 77.5);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_default_all_zero_produces_error_code1_zero(void)
+{
+    TEST("err1: high thresholds with valid idx -> error_code1 = 0");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+    dev->err1_th_sse_dmean[1] = 2000;
+    dev->err1_th_sse_dmean[2] = 3000;
+    dev->err1_n_last = 100;  /* high threshold for TD count */
+
+    args->idx = 5;
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    ASSERT_EQ(dbg->error_code1, 0);
+    ASSERT_EQ(dbg->err1_result, 0);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+static void test_err1_break_flag_history_shifts(void)
+{
+    TEST("err1: TD_temporary_break_flag_past_range shifts left by 1");
+    struct air1_opcal4_arguments_t *args = alloc_args();
+    struct air1_opcal4_device_info_t *dev = alloc_dev_info();
+    struct air1_opcal4_debug_t *dbg = alloc_debug();
+
+    setup_err1_dev_info(dev);
+    dev->err1_current_avg_diff = 1000;
+    dev->err1_th_sse_dmean[0] = 1000;
+
+    args->idx = 5;
+
+    /* Set up time entries so TD processing runs (need >= 2 non-zero times) */
+    args->err1_time_1min[178] = 1000;
+    args->err1_time_1min[179] = 2000;
+
+    /* Set recognizable pattern in break flag history */
+    args->err1_TD_temporary_break_flag_past_range[0] = 10;
+    args->err1_TD_temporary_break_flag_past_range[1] = 20;
+    args->err1_TD_temporary_break_flag_past_range[35] = 99;
+
+    check_error(args, dev, dbg, 50, 5.0);
+
+    /* After shift: [0] = old [1] = 20 */
+    ASSERT_EQ(args->err1_TD_temporary_break_flag_past_range[0], 20);
+
+    free(args); free(dev); free(dbg);
+    PASS();
+}
+
+/* ════════════════════════════════════════════════════════════════════
  * Full pipeline default behavior test
  * ════════════════════════════════════════════════════════════════════ */
 
@@ -1940,7 +2430,12 @@ static void test_check_error_stubs_produce_zero(void)
      * With all-zero dev_info, err8 produces 1 because start_offset=0
      * makes the data sufficiency check vacuously true. Use reasonable
      * threshold values to get the expected default behavior.
+     *
+     * Similarly, err1 with all-zero data sets random_noise_temp_break=1
+     * because 0.0 >= 0.0 passes its threshold check. Force err1 early
+     * exit to isolate pipeline behavior testing.
      */
+    dev->err1_seq[0] = 255;
     dev->err345_seq4[0] = 10;   /* start_offset */
     dev->err345_seq4[1] = 20;   /* window_size */
     dev->err345_seq4[2] = 5;    /* sum_threshold */
@@ -1949,7 +2444,7 @@ static void test_check_error_stubs_produce_zero(void)
 
     check_error(args, dev, dbg, 100, 5.0);
 
-    /* err32: all stubs produce 0 flags -> error_code32 = 0 */
+    /* err32: all detectors produce 0 flags -> error_code32 = 0 */
     ASSERT_EQ(dbg->error_code32, 0);
     /* err8: no accu_seq data, reasonable thresholds -> error_code8 = 0 */
     ASSERT_EQ(dbg->error_code8, 0);
@@ -2036,6 +2531,24 @@ int main(void)
     test_err16_result_prev_stored();
     test_err16_debug_outputs_initialized();
     test_err16_multiple_seq_calls_stable();
+
+    printf("\nerr1 (contact/noise):\n");
+    test_err1_early_exit_low_seq();
+    test_err1_early_exit_preserves_prev_fields();
+    test_err1_initializes_debug_on_main_path();
+    test_err1_sse_d_mean_computed();
+    test_err1_sse_d_mean_zero_for_constant();
+    test_err1_contact_bad_from_avg_diff();
+    test_err1_contact_good_below_threshold();
+    test_err1_history_100_shifts_left();
+    test_err1_signal_180_shifts_left();
+    test_err1_random_noise_break_all_zero_threshold();
+    test_err1_random_noise_break_high_threshold();
+    test_err1_td_skipped_insufficient_time_data();
+    test_err1_epilogue_stores_result_prev();
+    test_err1_prev_last_1min_curr_updated();
+    test_err1_default_all_zero_produces_error_code1_zero();
+    test_err1_break_flag_history_shifts();
 
     printf("\nEpilogue:\n");
     test_err_delay_arr_shift();
