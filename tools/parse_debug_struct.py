@@ -13,7 +13,6 @@ import json
 import math
 import struct
 import sys
-from collections import OrderedDict
 from pathlib import Path
 
 # --------------------------------------------------------------------------- #
@@ -267,7 +266,7 @@ def _compute_expected_size(fields):
 
 
 def parse_binary(data, fields, expected_size, struct_name="struct"):
-    """Parse a binary buffer into an OrderedDict using the given field list.
+    """Parse a binary buffer into an dict using the given field list.
 
     Args:
         data: bytes object
@@ -276,14 +275,14 @@ def parse_binary(data, fields, expected_size, struct_name="struct"):
         struct_name: name for error messages
 
     Returns:
-        OrderedDict mapping field names to values (scalars or lists).
+        dict mapping field names to values (scalars or lists).
     """
     if len(data) != expected_size:
         raise ValueError(
             f"{struct_name}: expected {expected_size} bytes, got {len(data)}"
         )
 
-    result = OrderedDict()
+    result = dict()
     offset = 0
 
     for name, fmt, count in fields:
@@ -324,17 +323,22 @@ def parse_output(data):
 # Field type classification
 # --------------------------------------------------------------------------- #
 
-# Build lookup: field_name -> fmt_char
-_DEBUG_FIELD_TYPES = {name: fmt for name, fmt, _count in DEBUG_FIELDS}
-_OUTPUT_FIELD_TYPES = {name: fmt for name, fmt, _count in OUTPUT_FIELDS}
+# Build lookup: field_name -> fmt_char (public API, used by compare_debug.py)
+DEBUG_FIELD_TYPES = {name: fmt for name, fmt, _count in DEBUG_FIELDS}
+OUTPUT_FIELD_TYPES = {name: fmt for name, fmt, _count in OUTPUT_FIELDS}
 
 
 def is_float_field(name, field_types=None):
-    """Return True if the field is a floating-point type."""
+    """Return True if the field is a floating-point type.
+
+    Raises KeyError if the field name is not known (protects against typos
+    silently changing comparison mode in safety-critical verification).
+    """
     if field_types is None:
-        field_types = _DEBUG_FIELD_TYPES
-    fmt = field_types.get(name, "")
-    return fmt in ("d", "f")
+        field_types = DEBUG_FIELD_TYPES
+    if name not in field_types:
+        raise KeyError(f"Unknown field name: {name!r}")
+    return field_types[name] in ("d", "f")
 
 
 def is_integer_field(name, field_types=None):
@@ -454,7 +458,7 @@ def main():
         struct_name = "air1_opcal4_output_t"
 
     if args.json:
-        # Convert OrderedDict to regular dict for JSON serialization
+        # Convert dict to regular dict for JSON serialization
         # Handle NaN/Inf which are not valid JSON
         def sanitize(obj):
             if isinstance(obj, float):

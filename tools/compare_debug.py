@@ -11,16 +11,18 @@ Exit code: 0 if all fields match, 1 if any differ.
 import argparse
 import math
 import sys
-from collections import OrderedDict
 from pathlib import Path
 
-from parse_debug_struct import (
+# Ensure tools/ is on sys.path for imports regardless of working directory
+sys.path.insert(0, str(Path(__file__).parent))
+
+from parse_debug_struct import (  # noqa: E402
     DEBUG_EXPECTED_SIZE,
     DEBUG_FIELDS,
+    DEBUG_FIELD_TYPES,
     OUTPUT_EXPECTED_SIZE,
     OUTPUT_FIELDS,
-    _DEBUG_FIELD_TYPES,
-    _OUTPUT_FIELD_TYPES,
+    OUTPUT_FIELD_TYPES,
     is_float_field,
     parse_debug,
     parse_output,
@@ -128,9 +130,6 @@ def _compare_float(name, expected, actual, cross_platform=False):
     if expected == actual:
         return True, None
 
-    if expected == 0.0 and actual == 0.0:
-        return True, None
-
     abs_diff = abs(expected - actual)
     rel_diff = _relative_diff(expected, actual)
 
@@ -175,8 +174,8 @@ def compare_structs(ref_parsed, test_parsed, fields, field_types,
     """Compare two parsed struct dicts field by field.
 
     Args:
-        ref_parsed: OrderedDict from reference binary
-        test_parsed: OrderedDict from test binary
+        ref_parsed: dict from reference binary
+        test_parsed: dict from test binary
         fields: field descriptor list (for ordering)
         field_types: dict mapping field_name -> fmt_char
         cross_platform: if True, use relaxed float tolerance
@@ -328,13 +327,13 @@ def main():
         ref_parsed = parse_debug(ref_data)
         test_parsed = parse_debug(test_data)
         fields = DEBUG_FIELDS
-        field_types = _DEBUG_FIELD_TYPES
+        field_types = DEBUG_FIELD_TYPES
         struct_name = "air1_opcal4_debug_t"
     else:
         ref_parsed = parse_output(ref_data)
         test_parsed = parse_output(test_data)
         fields = OUTPUT_FIELDS
-        field_types = _OUTPUT_FIELD_TYPES
+        field_types = OUTPUT_FIELD_TYPES
         struct_name = "air1_opcal4_output_t"
 
     matches, mismatches = compare_structs(
