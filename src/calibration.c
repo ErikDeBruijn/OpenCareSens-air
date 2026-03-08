@@ -350,12 +350,14 @@ unsigned char air1_opcal4_algorithm(
 
     /* --- Step 7b: Initstable counter ---
      * Oracle-verified: increments when baseline change (diff_dc) is small.
-     * Resets to 0 when diff_dc exceeds threshold (signal instability).
-     * Threshold ≈ shift_m2_x100[0]/1000 = 0.017 */
+     * Resets to 0 when |diff_dc| >= threshold (signal instability).
+     * Threshold is hardcoded 0.01 in get_params (algo_params+0x308/+0x310).
+     * Counter increments when -0.01 < diff_dc < 0.01. */
     {
-        double threshold = (double)dev_info->shift_m2_x100[0] / 1000.0;
+        const double threshold = 0.01;
         if (algo_args->idx_origin_seq > 1) {
-            if (algo_debug->initstable_diff_dc < threshold)
+            double diff_dc = algo_debug->initstable_diff_dc;
+            if (diff_dc < threshold && diff_dc > -threshold)
                 algo_args->initstable_initcnt++;
             else
                 algo_args->initstable_initcnt = 0;
@@ -471,7 +473,12 @@ unsigned char air1_opcal4_algorithm(
             algo_args->holt_trend += K1 * innovation;
             algo_args->holt_forecast = algo_args->holt_level + h * algo_args->holt_trend;
 
-            opcal_ad = init_cg + (algo_args->holt_forecast - init_cg) * (double)(cnt - 1) / 24.0;
+            if (cnt > 25) {
+                /* Binary bypasses blend when cnt > 25 (bhi 0x64ccc) */
+                opcal_ad = algo_args->holt_forecast;
+            } else {
+                opcal_ad = init_cg + (algo_args->holt_forecast - init_cg) * (double)(cnt - 1) / 24.0;
+            }
         }
     }
     algo_debug->opcal_ad = opcal_ad;
