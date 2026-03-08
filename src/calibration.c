@@ -393,8 +393,6 @@ unsigned char air1_opcal4_algorithm(
      *
      * Flag management: after basic_warmup readings, flag=3 for 6 steps
      * (post-warmup transition), then returns to 0.
-     * In full implementation, check_error also sets flag=3 on glucose
-     * level changes (Task #10).
      *
      * Counter: stays at 1 during flag=3 and transition steps.
      * Starts incrementing once flag=0 and idx >= 2*err345_seq2.
@@ -412,7 +410,7 @@ unsigned char air1_opcal4_algorithm(
         else
             algo_args->bias_flag = 0;
 
-        /* Counter: reset to 1 during flag=3 or on flag 3→0 transition.
+        /* Counter: reset to 1 during flag=3 or on flag 3->0 transition.
          * Increment when stable (flag=0, prev=0) and past settling time. */
         if (algo_args->bias_flag == 3) {
             algo_args->bias_cnt = 1;
