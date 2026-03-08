@@ -28,8 +28,9 @@ import os
 import sys
 import numpy as np
 
-BASE = '/tmp/caresens-air/oracle/output/lot0'
-LIB_PATH = '/tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so'
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+BASE = os.path.join(REPO_ROOT, 'oracle/output/lot0')
+LIB_PATH = os.path.join(REPO_ROOT, 'vendor/native/lib/armeabi-v7a/libCALCULATION.so')
 
 
 def read_doubles(data, offset, count):

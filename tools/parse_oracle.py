@@ -5,8 +5,8 @@ Used to verify our reimplementation against the real libCALCULATION.so output.
 
 Usage:
     python3 parse_oracle.py <output_dir> [seq_number]
-    python3 parse_oracle.py /tmp/caresens-air/oracle/output/lot0 1
-    python3 parse_oracle.py /tmp/caresens-air/oracle/output/lot0  # show summary
+    python3 parse_oracle.py oracle/output/lot0 1
+    python3 parse_oracle.py oracle/output/lot0  # show summary
 """
 
 import struct

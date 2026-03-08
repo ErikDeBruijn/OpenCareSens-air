@@ -321,14 +321,14 @@ Raw ADC (30× uint16_t from BLE)
 
 ## 7. Complete Function Inventory (opcal4 only)
 
-### Disassembly available at: `/tmp/caresens-air/disasm_fixed/`
+### Disassembly available at: `reference/disasm/`
 
 ### How to create disassembly for any function
 ```bash
 OBJDUMP=$(xcrun --find llvm-objdump)
 $OBJDUMP -d --triple=thumbv7-linux-gnueabi \
     --start-address=<ELF_VMA_START> --stop-address=<ELF_VMA_END> \
-    /tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so > output.asm
+    vendor/native/lib/armeabi-v7a/libCALCULATION.so > output.asm
 ```
 
 ### Main Entry Point
@@ -396,7 +396,7 @@ $OBJDUMP -d --triple=thumbv7-linux-gnueabi \
 ## 8. Ghidra Decompiled Code Reference
 
 ### Location
-`/tmp/caresens-air/decompiled_c/all_functions.c` (8735 lines, 267KB)
+`vendor/decompiled_c/all_functions.c` (8735 lines, 267KB — from original Ghidra analysis)
 
 ### What's Useful vs Not
 - **Math utilities (lines ~1000-3000):** Fully decompiled, directly usable as implementation reference
@@ -558,9 +558,9 @@ The C header yields offsets ~13 bytes lower. Always use the disassembly offsets.
   with available args checkpoints
 
 **Implementation files:**
-- `/tmp/caresens-air/tools/irls_with_kernel.py` -- IRLS with extracted kernel table
-- `/tmp/caresens-air/tools/full_simulation.py` -- end-to-end validation
-- `/tmp/caresens-air/tools/gdb_dump_intermediate.py` -- FIR on medians validation
+- `tools/irls_with_kernel.py` -- IRLS with extracted kernel table
+- `tools/full_simulation.py` -- end-to-end validation
+- `tools/gdb_dump_intermediate.py` -- FIR on medians validation
 
 ### lot_type Determination
 On first call (seq==1), the algorithm determines `lot_type` from `eapp`:
@@ -702,16 +702,16 @@ The reverse (we don't trigger an error that should trigger) is even more dangero
 | Struct definitions | `/Users/erik/github.com/j-kaltes/Juggluco/Common/src/main/cpp/air/air.hpp` | ALL struct definitions with defaults |
 | Algorithm call site | `/Users/erik/github.com/j-kaltes/Juggluco/Common/src/main/cpp/air/java.cpp` | How Juggluco calls the algorithm |
 | BLE protocol | `/Users/erik/github.com/j-kaltes/Juggluco/Common/src/dex/java/tk/glucodata/AirGattCallback.java` | Complete BLE communication flow |
-| Debug struct layout | `/tmp/caresens-air/decompiled/sources/com/isens/airsdk/module/type/DebugData4Obj.java` | Byte-level layout of debug_t (1579 bytes) |
-| Proprietary library | `/tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so` | The reference implementation |
+| Debug struct layout | `vendor/decompiled/sources/com/isens/airsdk/module/type/DebugData4Obj.java` | Byte-level layout of debug_t (1579 bytes) |
+| Proprietary library | `vendor/native/lib/armeabi-v7a/libCALCULATION.so` | The reference implementation |
 
 ### Generated Analysis Files
 | File | Path | Purpose |
 |------|------|---------|
-| Ghidra decompiled C | `/tmp/caresens-air/decompiled_c/all_functions.c` | 8735 lines, partial decompilation |
-| ARM disassembly | `/tmp/caresens-air/disasm_fixed/*.asm` | Complete disassembly of key functions |
-| Implementation plan | `/tmp/caresens-air/docs/plans/2026-03-06-caresens-air-calibration-cleanroom.md` | 31-task implementation plan |
-| This document | `/tmp/caresens-air/docs/reference/caresens-air-knowledge-base.md` | Complete reference |
+| Ghidra decompiled C | `vendor/decompiled_c/all_functions.c` | 8735 lines, partial decompilation (from original Ghidra analysis) |
+| ARM disassembly | `reference/disasm/*.asm` | Complete disassembly of key functions |
+| Implementation plan | `docs/plans/2026-03-06-caresens-air-calibration-cleanroom.md` | 31-task implementation plan |
+| This document | `docs/reference/caresens-air-knowledge-base.md` | Complete reference |
 
 ### Disassembly Files Detail
 | File | Function | Instructions |
@@ -736,7 +736,7 @@ The reverse (we don't trigger an error that should trigger) is even more dangero
 For each function that needs ARM→C conversion:
 
 ### Input to LLM
-1. **ARM disassembly** from `/tmp/caresens-air/disasm_fixed/`
+1. **ARM disassembly** from `reference/disasm/`
 2. **Function signature** (from llvm-nm and Ghidra prologue)
 3. **Local variable names** (from Ghidra's stack frame analysis — even truncated functions show variable declarations)
 4. **Struct definitions** (from `air.hpp`)
@@ -778,13 +778,13 @@ For each function that needs ARM→C conversion:
 ```bash
 # Get complete symbol table
 LLVM_NM=$(xcrun --find llvm-nm)
-$LLVM_NM /tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so | sort
+$LLVM_NM vendor/native/lib/armeabi-v7a/libCALCULATION.so | sort
 
 # Disassemble specific function (use ELF VMA addresses, NOT Ghidra addresses)
 OBJDUMP=$(xcrun --find llvm-objdump)
 $OBJDUMP -d --triple=thumbv7-linux-gnueabi \
     --start-address=0x6ccbc --stop-address=0x6cde8 \
-    /tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so
+    vendor/native/lib/armeabi-v7a/libCALCULATION.so
 
 # Convert Ghidra address to ELF VMA
 # ELF_VMA = GHIDRA_ADDR - 0x10000

@@ -5,7 +5,7 @@
  * reimplementation with the same inputs, comparing every field.
  *
  * Usage: ./compare_oracle <oracle_dir> [--eapp <val>] [--max <N>] [--verbose]
- *        ./compare_oracle /tmp/caresens-air/oracle/output/lot0
+ *        ./compare_oracle oracle/output/lot0
  */
 #include <stdio.h>
 #include <stdlib.h>

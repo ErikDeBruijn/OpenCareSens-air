@@ -1,5 +1,5 @@
 
-/tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so:	file format elf32-littlearm
+vendor/native/lib/armeabi-v7a/libCALCULATION.so:	file format elf32-littlearm
 
 Disassembly of section .text:
 

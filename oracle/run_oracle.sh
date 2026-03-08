@@ -37,7 +37,7 @@ if [[ oracle_harness.c -nt oracle_harness_arm ]]; then
     chmod +x oracle_harness_arm
 fi
 
-SO_PATH="$(cd ../native/lib/armeabi-v7a && pwd)/libCALCULATION.so"
+SO_PATH="$(cd ../vendor/native/lib/armeabi-v7a && pwd)/libCALCULATION.so"
 
 for lot_num in "${LOT_TYPES[@]}"; do
     eapp=${EAPP_MAP[$lot_num]}
