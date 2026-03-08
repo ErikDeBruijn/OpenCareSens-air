@@ -6,8 +6,8 @@
 
 ## 1. Project Context: Why This Exists
 
-### The Problem
-The CareSens Air CGM sensor works with the proprietary i-SENS app or with Juggluco (an open-source app that wraps the proprietary library). But it does NOT work with xDrip+ or AndroidAPS — the two most important open-source apps in the DIY diabetes community — because these apps cannot bundle the proprietary `libCALCULATION.so`. Type 1 diabetes patients who rely on the CareSens Air sensor are locked out of the open-source ecosystem that many depend on for insulin dosing automation.
+### The Patient
+Laurens, a 9-year-old boy with Type 1 diabetes, uses the CareSens Air CGM sensor. His father (Erik's nephew) manages his glucose monitoring. The CareSens Air works with the proprietary i-SENS app or with Juggluco (an open-source app that wraps the proprietary library). But it does NOT work with xDrip+ or AndroidAPS — the two most important open-source apps in the DIY diabetes community — because these apps cannot bundle the proprietary `libCALCULATION.so`.
 
 ### The Goal
 Build an open-source, GPL-compatible reimplementation of the calibration algorithm so that CareSens Air can be directly integrated into xDrip+ and AndroidAPS, eliminating the need for Juggluco as intermediary.
@@ -321,14 +321,14 @@ Raw ADC (30× uint16_t from BLE)
 
 ## 7. Complete Function Inventory (opcal4 only)
 
-### Disassembly available at: `vendor/disasm/`
+### Disassembly available at: `/tmp/caresens-air/disasm_fixed/`
 
 ### How to create disassembly for any function
 ```bash
 OBJDUMP=$(xcrun --find llvm-objdump)
 $OBJDUMP -d --triple=thumbv7-linux-gnueabi \
     --start-address=<ELF_VMA_START> --stop-address=<ELF_VMA_END> \
-    vendor/native/lib/armeabi-v7a/libCALCULATION.so > output.asm
+    /tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so > output.asm
 ```
 
 ### Main Entry Point
@@ -396,7 +396,7 @@ $OBJDUMP -d --triple=thumbv7-linux-gnueabi \
 ## 8. Ghidra Decompiled Code Reference
 
 ### Location
-`vendor/decompiled_c/all_functions.c` (8735 lines, 267KB)
+`/tmp/caresens-air/decompiled_c/all_functions.c` (8735 lines, 267KB)
 
 ### What's Useful vs Not
 - **Math utilities (lines ~1000-3000):** Fully decompiled, directly usable as implementation reference
@@ -476,7 +476,91 @@ Inlined in main function. Uses `vref`, `eapp`, `slope100`:
 ```
 current = (ADC_value * vref / 65536 - eapp) * slope100 / 100
 ```
-(Exact formula to be confirmed from disassembly — verify against `debug.tran_inA[30]`)
+(Exact formula to be confirmed from disassembly -- verify against `debug.tran_inA[30]`)
+
+### tran_inA Processing Pipeline (FULLY SOLVED)
+
+The complete algorithm from `tran_inA[30]` (per-sample ADC-converted values) to
+`tran_inA_1min[5]` (one-minute current averages) has been reverse-engineered and
+validated against the oracle with bit-perfect accuracy across all tested sequences.
+
+**Algorithm Flow:**
+```
+tran_inA[30] (from per-sample loop with outlier removal at indices 4,14,20,28)
+  |
+  +-- seq <= 2 OR time_gap >= 897.2s: SIMPLE PATH
+  |     intermediate_30 = tran_inA (pass-through)
+  |
+  +-- seq >= 3 AND time_gap < 897.2s: IRLS LOESS PATH
+  |     data_90 = [history_60, per_sample_output_30]
+  |     intermediate_30 = irls_loess(data_90)[60:90]  (last 30 of 90 fitted values)
+  |
+  +-- Running Median Filter (5 groups x 6 windows)
+  |     For each group of 6 values, compute 6 running medians:
+  |       median([0:3]), median([0:4]), median([0:5]), median([0:6]),
+  |       median([1:6]), median([2:6])
+  |     Result: 30 running medians
+  |
+  +-- FIR Filter (if seq >= 2 AND time_gap < 327.2s)
+  |     Coefficients: [-0.25, 1.0, 1.75, 2.0, 1.75, 1.0, -0.25] / 7.0
+  |     Input: extended = prev3[3] + medians[30] = 33 values
+  |     For k=0..26: out[k] = sum(coeff[j] * extended[k+j]) / 7.0
+  |     Boundary (k=27,28,29): truncated filter, denominators 7.25, 6.25, 4.5
+  |     Update prev3 = medians[27:30] (raw un-FIR'd medians, stored at args+0xf48)
+  |
+  +-- cal_average_without_min_max (per group of 6)
+        For each group of 6 FIR'd medians: remove min and max, average remaining 4
+        Result: tran_inA_1min[5]
+```
+
+**IRLS LOESS Regression Details:**
+
+The IRLS LOESS regression at 0x63cf2-0x63eba performs locally-weighted polynomial
+(degree 1) regression with bisquare reweighting:
+
+- **Input:** 90 data points with 1-based x-values (x=1..90)
+  - data[0:30] = oldest history (args+0xd68, from 2 readings ago)
+  - data[30:60] = recent history (args+0xe58, from 1 reading ago, PRE-call state)
+  - data[60:90] = current per-sample loop output
+
+- **LOESS kernel weights:** Pre-computed tricube kernel stored as 90x45 doubles
+  at symbol `air1_opcal4_loess_weight_arr` (ELF address 0x29240, file offset 0x29240).
+  Each row = one data point, each column = one eval point (for eval points 0-44).
+  For eval points 45-89, use symmetry: weight[e][d] = table[89-d][89-e].
+  Bandwidth varies per eval point (k-nearest neighbor, k=86 of 90 points).
+
+- **Bisquare reweighting:** Up to 3 iterations.
+  After each fit: compute absolute residuals, find median absolute residual,
+  set threshold = 6.0 * median_abs_resid,
+  bisquare_weight[i] = (1 - min(|residual[i]|/threshold, 1)^2)^2.
+  If any weight is NaN, stop iterations early.
+
+- **Output:** 90 fitted values. Take fitted[60:90] as the intermediate array
+  that feeds the running median filter.
+
+**Key Offsets in arguments_t (from disassembly, NOT from C header):**
+```
+args + 0x0d38: prev_current[5] (5 doubles)
+args + 0x0d68: prev_outlier_removed_curr[0:30] (30 doubles, old history)
+args + 0x0e58: prev_outlier_removed_curr[30:60] (30 doubles, current history)
+args + 0x0f48: prev_mov_median_curr[3] (3 doubles, prev3 for FIR)
+args + 0x0648: args_seq (uint16_t, incremented early in the function)
+```
+NOTE: These offsets do NOT match the computed offsets from the C header struct.
+The C header yields offsets ~13 bytes lower. Always use the disassembly offsets.
+
+**Verification Status:**
+- Seq 1 (simple, no FIR): PERFECT MATCH (delta < 4e-15)
+- Seq 2 (simple, with FIR): PERFECT MATCH (delta < 8e-15)
+- Seq 3-10 (IRLS + FIR): PERFECT MATCH (delta < 8e-14)
+- Seq 24-25 (IRLS + FIR, with glucose change): PERFECT MATCH (delta < 8e-14)
+- Full end-to-end simulation maintaining state: CONFIRMED for all sequences
+  with available args checkpoints
+
+**Implementation files:**
+- `/tmp/caresens-air/tools/irls_with_kernel.py` -- IRLS with extracted kernel table
+- `/tmp/caresens-air/tools/full_simulation.py` -- end-to-end validation
+- `/tmp/caresens-air/tools/gdb_dump_intermediate.py` -- FIR on medians validation
 
 ### lot_type Determination
 On first call (seq==1), the algorithm determines `lot_type` from `eapp`:
@@ -618,16 +702,16 @@ The reverse (we don't trigger an error that should trigger) is even more dangero
 | Struct definitions | `/Users/erik/github.com/j-kaltes/Juggluco/Common/src/main/cpp/air/air.hpp` | ALL struct definitions with defaults |
 | Algorithm call site | `/Users/erik/github.com/j-kaltes/Juggluco/Common/src/main/cpp/air/java.cpp` | How Juggluco calls the algorithm |
 | BLE protocol | `/Users/erik/github.com/j-kaltes/Juggluco/Common/src/dex/java/tk/glucodata/AirGattCallback.java` | Complete BLE communication flow |
-| Debug struct layout | `vendor/decompiled_java/sources/com/isens/airsdk/module/type/DebugData4Obj.java` | Byte-level layout of debug_t (1579 bytes) |
-| Proprietary library | `vendor/native/lib/armeabi-v7a/libCALCULATION.so` | The reference implementation |
+| Debug struct layout | `/tmp/caresens-air/decompiled/sources/com/isens/airsdk/module/type/DebugData4Obj.java` | Byte-level layout of debug_t (1579 bytes) |
+| Proprietary library | `/tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so` | The reference implementation |
 
 ### Generated Analysis Files
 | File | Path | Purpose |
 |------|------|---------|
-| Ghidra decompiled C | `vendor/decompiled_c/all_functions.c` | 8735 lines, partial decompilation |
-| ARM disassembly | `vendor/disasm/*.asm` | Complete disassembly of key functions |
-| Implementation plan | `docs/plans/2026-03-06-caresens-air-calibration-cleanroom.md` | 31-task implementation plan |
-| This document | `docs/reference/caresens-air-knowledge-base.md` | Complete reference |
+| Ghidra decompiled C | `/tmp/caresens-air/decompiled_c/all_functions.c` | 8735 lines, partial decompilation |
+| ARM disassembly | `/tmp/caresens-air/disasm_fixed/*.asm` | Complete disassembly of key functions |
+| Implementation plan | `/tmp/caresens-air/docs/plans/2026-03-06-caresens-air-calibration-cleanroom.md` | 31-task implementation plan |
+| This document | `/tmp/caresens-air/docs/reference/caresens-air-knowledge-base.md` | Complete reference |
 
 ### Disassembly Files Detail
 | File | Function | Instructions |
@@ -652,7 +736,7 @@ The reverse (we don't trigger an error that should trigger) is even more dangero
 For each function that needs ARM→C conversion:
 
 ### Input to LLM
-1. **ARM disassembly** from `vendor/disasm/`
+1. **ARM disassembly** from `/tmp/caresens-air/disasm_fixed/`
 2. **Function signature** (from llvm-nm and Ghidra prologue)
 3. **Local variable names** (from Ghidra's stack frame analysis — even truncated functions show variable declarations)
 4. **Struct definitions** (from `air.hpp`)
@@ -694,13 +778,13 @@ For each function that needs ARM→C conversion:
 ```bash
 # Get complete symbol table
 LLVM_NM=$(xcrun --find llvm-nm)
-$LLVM_NM vendor/native/lib/armeabi-v7a/libCALCULATION.so | sort
+$LLVM_NM /tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so | sort
 
 # Disassemble specific function (use ELF VMA addresses, NOT Ghidra addresses)
 OBJDUMP=$(xcrun --find llvm-objdump)
 $OBJDUMP -d --triple=thumbv7-linux-gnueabi \
     --start-address=0x6ccbc --stop-address=0x6cde8 \
-    vendor/native/lib/armeabi-v7a/libCALCULATION.so
+    /tmp/caresens-air/native/lib/armeabi-v7a/libCALCULATION.so
 
 # Convert Ghidra address to ELF VMA
 # ELF_VMA = GHIDRA_ADDR - 0x10000
