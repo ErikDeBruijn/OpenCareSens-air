@@ -11,10 +11,22 @@
 # Optional:
 #   - Ghidra (for C decompilation — see Step 5)
 #
-# Usage: ./scripts/setup-vendor.sh <path-to-airsdk-apk>
+# Usage:
+#   ./scripts/setup-vendor.sh <path-to-file>
 #
-# The APK can be obtained from APK mirror sites. Look for: com.isens.airsdk
-# (the CareSens Air SDK app, NOT the main CareSens Air app).
+# The input file can be:
+#   - An .xapk file (split APK bundle, e.g. from APKPure)
+#   - A regular .apk file
+#
+# How to obtain the CareSens Air app:
+#   1. Go to https://apkpure.com/caresens-air/com.isens.csair/download
+#   2. Download the XAPK file (~30 MB)
+#   3. The app package is com.isens.csair (CareSens Air by i-SENS)
+#   4. You need the armeabi-v7a (32-bit ARM) variant for the oracle harness.
+#      APKPure offers multiple variants per version — choose the one that
+#      includes "armeabi-v7a" (not "arm64-v8a" / "x86").
+#      If only XAPK format is available, the script will automatically
+#      extract the correct split APK from it.
 
 set -euo pipefail
 
@@ -22,12 +34,21 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 VENDOR_DIR="$PROJECT_DIR/vendor"
 
-APK_PATH="${1:-}"
+INPUT_PATH="${1:-}"
 
-if [ -z "$APK_PATH" ]; then
-    echo "Usage: $0 <path-to-airsdk-apk>"
+if [ -z "$INPUT_PATH" ]; then
+    echo "Usage: $0 <path-to-xapk-or-apk>"
     echo ""
-    echo "Download the CareSens Air SDK APK (com.isens.airsdk) and provide the path."
+    echo "Download the CareSens Air app (com.isens.csair) and provide the path."
+    echo ""
+    echo "Supported formats:"
+    echo "  .xapk  — Split APK bundle (from APKPure, recommended)"
+    echo "  .apk   — Regular APK"
+    echo ""
+    echo "How to download:"
+    echo "  1. Visit https://apkpure.com/caresens-air/com.isens.csair/download"
+    echo "  2. Download the XAPK (~30 MB)"
+    echo "  3. Make sure to pick the armeabi-v7a (32-bit ARM) variant"
     echo ""
     echo "This script will:"
     echo "  1. Extract libCALCULATION.so (ARM native library)"
@@ -40,8 +61,8 @@ if [ -z "$APK_PATH" ]; then
     exit 1
 fi
 
-if [ ! -f "$APK_PATH" ]; then
-    echo "Error: APK not found at $APK_PATH"
+if [ ! -f "$INPUT_PATH" ]; then
+    echo "Error: File not found at $INPUT_PATH"
     exit 1
 fi
 
@@ -72,17 +93,91 @@ mkdir -p "$VENDOR_DIR"/{apk,native,decompiled_java,decompiled_c,disasm}
 # ── Step 1: Extract native library ──
 echo ""
 echo "=== Step 1: Extracting native library ==="
-mkdir -p "$VENDOR_DIR/apk"
-cp "$APK_PATH" "$VENDOR_DIR/apk/"
-cd "$VENDOR_DIR/apk"
-unzip -o "$(basename "$APK_PATH")" "lib/armeabi-v7a/libCALCULATION.so" -d extracted/ 2>/dev/null || true
-if [ -f extracted/lib/armeabi-v7a/libCALCULATION.so ]; then
+WORK_DIR="$VENDOR_DIR/apk"
+mkdir -p "$WORK_DIR"
+cp "$INPUT_PATH" "$WORK_DIR/"
+cd "$WORK_DIR"
+
+INPUT_FILE="$(basename "$INPUT_PATH")"
+SO_FOUND=false
+APK_FOR_JADX=""
+
+# Determine input type and extract accordingly
+case "$INPUT_FILE" in
+    *.xapk)
+        echo "  Detected XAPK (split APK bundle)"
+        mkdir -p xapk_contents
+        unzip -o "$INPUT_FILE" -d xapk_contents/ 2>/dev/null
+
+        # Try to find the armeabi-v7a split APK first (needed for oracle harness)
+        if [ -f xapk_contents/config.armeabi_v7a.apk ]; then
+            echo "  Found config.armeabi_v7a.apk split"
+            mkdir -p extracted
+            unzip -o xapk_contents/config.armeabi_v7a.apk "lib/armeabi-v7a/libCALCULATION.so" -d extracted/ 2>/dev/null || true
+            if [ -f extracted/lib/armeabi-v7a/libCALCULATION.so ]; then
+                SO_FOUND=true
+            fi
+        fi
+
+        # If no armeabi-v7a, try arm64-v8a (will need different oracle setup)
+        if [ "$SO_FOUND" = false ] && [ -f xapk_contents/config.arm64_v8a.apk ]; then
+            echo "  WARNING: No armeabi-v7a split found. Found arm64-v8a instead."
+            echo "  The oracle harness is built for 32-bit ARM (armeabi-v7a)."
+            echo "  Try downloading a different variant from APKPure that includes armeabi-v7a."
+            echo ""
+            echo "  Extracting arm64-v8a anyway for reference..."
+            mkdir -p extracted
+            unzip -o xapk_contents/config.arm64_v8a.apk "lib/arm64-v8a/libCALCULATION.so" -d extracted/ 2>/dev/null || true
+            if [ -f extracted/lib/arm64-v8a/libCALCULATION.so ]; then
+                echo "  Saved arm64-v8a library (NOT compatible with current oracle harness)"
+                mkdir -p "$VENDOR_DIR/native/lib/arm64-v8a/"
+                cp extracted/lib/arm64-v8a/libCALCULATION.so "$VENDOR_DIR/native/lib/arm64-v8a/"
+            fi
+        fi
+
+        # Also check if the base APK contains the .so directly
+        if [ "$SO_FOUND" = false ]; then
+            for apk in xapk_contents/*.apk; do
+                [ -f "$apk" ] || continue
+                if unzip -l "$apk" 2>/dev/null | grep -q "lib/armeabi-v7a/libCALCULATION.so"; then
+                    echo "  Found libCALCULATION.so in $(basename "$apk")"
+                    unzip -o "$apk" "lib/armeabi-v7a/libCALCULATION.so" -d extracted/ 2>/dev/null || true
+                    SO_FOUND=true
+                    break
+                fi
+            done
+        fi
+
+        # Use the base APK for jadx decompilation
+        if [ -f xapk_contents/com.isens.csair.apk ]; then
+            APK_FOR_JADX="$WORK_DIR/xapk_contents/com.isens.csair.apk"
+        fi
+        ;;
+    *.apk)
+        echo "  Detected regular APK"
+        mkdir -p extracted
+        unzip -o "$INPUT_FILE" "lib/armeabi-v7a/libCALCULATION.so" -d extracted/ 2>/dev/null || true
+        if [ -f extracted/lib/armeabi-v7a/libCALCULATION.so ]; then
+            SO_FOUND=true
+        fi
+        APK_FOR_JADX="$WORK_DIR/$INPUT_FILE"
+        ;;
+    *)
+        echo "  ERROR: Unsupported file format. Expected .xapk or .apk"
+        exit 1
+        ;;
+esac
+
+if [ "$SO_FOUND" = true ]; then
     mkdir -p "$VENDOR_DIR/native/lib/armeabi-v7a/"
     cp extracted/lib/armeabi-v7a/libCALCULATION.so "$VENDOR_DIR/native/lib/armeabi-v7a/"
-    echo "  OK: libCALCULATION.so extracted"
+    echo "  OK: libCALCULATION.so (armeabi-v7a) extracted"
 else
-    echo "  ERROR: libCALCULATION.so not found in APK"
-    echo "  Make sure you're using the SDK APK (com.isens.airsdk), not the main app."
+    echo "  ERROR: libCALCULATION.so (armeabi-v7a) not found"
+    echo ""
+    echo "  The oracle harness requires the 32-bit ARM (armeabi-v7a) library."
+    echo "  When downloading from APKPure, make sure to select the armeabi-v7a variant."
+    echo "  The arm64-v8a (64-bit) variant will NOT work with the current oracle setup."
     exit 1
 fi
 
@@ -118,14 +213,18 @@ fi
 echo ""
 echo "=== Step 3: Decompiling Java (jadx) ==="
 if command -v jadx &>/dev/null; then
-    jadx -d "$VENDOR_DIR/decompiled_java" "$APK_PATH" --no-res 2>/dev/null || true
-    # Verify key files were decompiled
-    KEY_JAVA="$VENDOR_DIR/decompiled_java/sources/com/isens/airsdk/module/type/DebugData4Obj.java"
-    if [ -f "$KEY_JAVA" ]; then
-        echo "  OK: Java decompiled (DebugData4Obj.java found)"
+    if [ -n "$APK_FOR_JADX" ] && [ -f "$APK_FOR_JADX" ]; then
+        jadx -d "$VENDOR_DIR/decompiled_java" "$APK_FOR_JADX" --no-res 2>/dev/null || true
+        # Verify key files were decompiled
+        KEY_JAVA="$VENDOR_DIR/decompiled_java/sources/com/isens/airsdk/module/type/DebugData4Obj.java"
+        if [ -f "$KEY_JAVA" ]; then
+            echo "  OK: Java decompiled (DebugData4Obj.java found)"
+        else
+            echo "  WARNING: Java decompiled but DebugData4Obj.java not found at expected path"
+            echo "  Look in vendor/decompiled_java/ for the actual layout"
+        fi
     else
-        echo "  WARNING: Java decompiled but DebugData4Obj.java not found at expected path"
-        echo "  Look in vendor/decompiled_java/ for the actual layout"
+        echo "  SKIP: No base APK found for jadx decompilation"
     fi
 else
     echo "  SKIP: jadx not installed"
