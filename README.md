@@ -1,6 +1,6 @@
 # OpenCareSens Air
 
-Open-source reimplementation of the CareSens Air CGM calibration algorithm (`libCALCULATION.so` by i-SENS) in pure C99. Converts raw ADC sensor readings to calibrated glucose values (mg/dL).
+Open-source reimplementation of the CareSens Air CGM calibration algorithm (`libCALCULATION.so` by i-SENS) in pure C99. Converts raw ADC sensor readings to calibrated glucose values (mg/dL or mmol/L).
 
 **Status: 100% output match** against the proprietary library on all tested scenarios (normal, low sensor parameter, hypoglycemia, hyperglycemia).
 
@@ -27,7 +27,7 @@ The complete pipeline was rewritten in standard C99 based on this input/output d
 ```
 raw ADC → eliminate_peak → IIR filter → drift correction → LOESS resampling
 → Savitzky-Golay smoothing → IRLS regression → 3-state Kalman filter
-→ Holt exponential smoothing → error detection → calibrated glucose (mg/dL)
+→ Holt exponential smoothing → error detection → calibrated glucose (mg/dL or mmol/L)
 ```
 
 ### Key discovery
@@ -38,11 +38,11 @@ The library's internal Kalman filter uses **fixed gains** (K = [0.6729, 1.761, 0
 
 | Lot | eapp | Profile | Output match |
 |-----|------|---------|-------------|
-| lot0 | 0.10067 | Normal (100→120→200→100 mg/dL) | 3600/3600 (100.0%) |
+| lot0 | 0.10067 | Normal (100→120→200→100 mg/dL or mmol/L) | 3600/3600 (100.0%) |
 | lot1 | 0.15 | Normal | 44.6% (errcode=64 unimplemented) |
 | lot2 | 0.05 | Normal | 3600/3600 (100.0%) |
-| lot3 | 0.10067 | Hypoglycemia (→45 mg/dL sustained) | 3600/3600 (100.0%) |
-| lot4 | 0.10067 | Hyperglycemia (→380+ mg/dL sustained) | 3600/3600 (100.0%) |
+| lot3 | 0.10067 | Hypoglycemia (→45 mg/dL or mmol/L sustained) | 3600/3600 (100.0%) |
+| lot4 | 0.10067 | Hyperglycemia (→380+ mg/dL or mmol/L sustained) | 3600/3600 (100.0%) |
 
 Each lot tests 400 sequential readings with 9 output fields per reading (3600 total). "100%" means every field matches bit-exact (integers) or to machine epsilon (doubles, max error ~5e-13).
 
@@ -111,7 +111,7 @@ scripts/
 
 ## Acknowledgments
 
-This project builds on the pioneering work of the [Juggluco](https://github.com/j-kaltes/Juggluco) project by Jaap Kaltes, and the broader "We Will Not Wait" community that has made CGM data accessible to those who need it.
+This project builds on the pioneering work of the [Juggluco](https://github.com/j-kaltes/Juggluco) project by Jaap Korthals Altes, and the broader "We Will Not Wait" community that has made CGM data accessible to those who need it.
 
 ## License
 
