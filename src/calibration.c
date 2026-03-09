@@ -668,24 +668,50 @@ unsigned char air1_opcal4_algorithm(
      * bias_flag: 0=inactive, 3=post-warmup transition or glucose change.
      * bias_cnt: step counter within correction period (1-indexed).
      *
-     * Flag management: after basic_warmup readings, flag=3 for 6 steps
-     * (post-warmup transition), then returns to 0.
+     * Flag management: after basic_warmup readings, flag=3 during post-warmup
+     * transition. The flag=3 period ends when init_cg has been stable for 3
+     * consecutive readings (|delta_init_cg| < 0.1), or after a maximum of 6
+     * steps — whichever comes first.
+     * Oracle-verified across lot0-lot4: lot0/lot2 need 6 steps (large init_cg
+     * jump at warmup boundary), lot3/lot4 terminate early at 5 (smaller jump,
+     * init_cg settles faster).
      *
      * Counter: stays at 1 during flag=3 and transition steps.
      * Starts incrementing once flag=0 and idx >= 2*err345_seq2.
-     * Oracle-verified: cnt=2 at idx=10 (with err345_seq2=5). */
+     * Oracle-verified: cnt=2 at idx=10 (with err345_seq2=5).
+     *
+     * Stability tracking uses init_cg_prev and nSumtrend to count how many
+     * consecutive readings have |init_cg - init_cg_prev| < 0.1. */
     {
         uint16_t prev_flag = algo_args->bias_flag;
         uint32_t idx = algo_args->idx_origin_seq;
         uint32_t bw = (uint32_t)dev_info->basic_warmup;
 
-        /* Flag: 0 during warmup, 3 for 6 post-warmup steps, then 0 */
-        if (idx <= bw)
+        /* Track init_cg stability during post-warmup period.
+         * nSumtrend counts consecutive stable readings (|delta_init_cg| < 0.1).
+         * init_cg_prev holds the previous reading's init_cg value. */
+        if (idx > 1) {
+            double delta_cg = fabs(init_cg - algo_args->init_cg_prev);
+            if (delta_cg < 0.1)
+                algo_args->nSumtrend += 1.0;
+            else
+                algo_args->nSumtrend = 0.0;
+        }
+
+        /* Flag: 0 during warmup; 3 during post-warmup transition until
+         * init_cg stabilizes (3 consecutive stable readings) or max 6 steps */
+        if (idx <= bw) {
             algo_args->bias_flag = 0;
-        else if (idx <= bw + 6)
-            algo_args->bias_flag = 3;
-        else
+        } else if (idx <= bw + 6) {
+            if (prev_flag == 3 && algo_args->nSumtrend >= 3.0)
+                algo_args->bias_flag = 0;  /* early termination: signal stable */
+            else if (prev_flag == 3 || idx == bw + 1)
+                algo_args->bias_flag = 3;
+            else
+                algo_args->bias_flag = 0;
+        } else {
             algo_args->bias_flag = 0;
+        }
 
         /* Counter: reset to 1 during flag=3 or on flag 3->0 transition.
          * Increment when stable (flag=0, prev=0) and past settling time. */
