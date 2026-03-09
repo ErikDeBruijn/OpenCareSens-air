@@ -185,27 +185,58 @@ void apply_simple_smooth(double *buffer, uint16_t n, double alpha)
 }
 
 /*
- * Hann window + low-pass smoothing for err16 drift detection.
- * From ARM disassembly (smooth1q_err16 @ 0x6d740, 162 instructions).
+ * Regularized DFT smoother for err16 drift detection.
+ * From ARM disassembly (smooth1q_err16 @ 0x6d740).
+ *
+ * Algorithm:
+ *   1. Compute Hann penalty weights: w[k] = 2 - 2*cos(2*pi*k/N)
+ *   2. For each frequency k, compute DFT coefficients (cos/sin sums),
+ *      then apply Tikhonov regularization: coeff / (1 + N * w[k]^2)
+ *   3. Inverse DFT reconstruction, normalized by 1/N.
+ *
+ * This penalizes high-frequency components via the Hann spectral weight,
+ * producing a smooth estimate of the underlying signal.
+ *
+ * Parameters:
+ *   in  - input data array (N elements)
+ *   out - output smoothed array (N elements, may alias in)
+ *   n   - number of data points (N)
  */
-void smooth1q_err16(const double *in, double *out, uint16_t n, uint16_t window)
+void smooth1q_err16(const double *in, double *out, uint16_t n)
 {
-    if (n == 0 || window == 0) return;
+    if (n == 0) return;
 
-    uint16_t half = window / 2;
+    /* Clear output */
+    memset(out, 0, n * sizeof(double));
 
-    for (uint16_t i = 0; i < n; i++) {
-        double sum = 0.0;
-        double wsum = 0.0;
-        for (int j = -(int)half; j <= (int)half; j++) {
-            int idx = (int)i + j;
-            if (idx < 0 || idx >= n) continue;
-            /* Hann window weight */
-            double w = 0.5 * (1.0 - cos(2.0 * M_PI * (j + half) / window));
-            sum += w * in[idx];
-            wsum += w;
+    for (uint16_t k = 0; k < n; k++) {
+        /* DFT: compute cosine and sine coefficients for frequency k */
+        double cos_sum = 0.0;
+        double sin_sum = 0.0;
+        for (uint16_t j = 0; j < n; j++) {
+            double angle = 2.0 * M_PI * k * j / n;
+            cos_sum += in[j] * cos(angle);
+            sin_sum += in[j] * sin(angle);
         }
-        out[i] = (wsum > 0.0) ? sum / wsum : in[i];
+
+        /* Hann penalty weight for this frequency */
+        double w = 2.0 - 2.0 * cos(2.0 * M_PI * k / n);
+
+        /* Tikhonov regularization: suppress high frequencies */
+        double reg = 1.0 / (1.0 + n * w * w);
+        cos_sum *= reg;
+        sin_sum *= reg;
+
+        /* Inverse DFT: accumulate contribution to each output sample */
+        for (uint16_t j = 0; j < n; j++) {
+            double angle = 2.0 * M_PI * k * j / n;
+            out[j] += cos_sum * cos(angle) + sin_sum * sin(angle);
+        }
+    }
+
+    /* Normalize */
+    for (uint16_t j = 0; j < n; j++) {
+        out[j] /= n;
     }
 }
 

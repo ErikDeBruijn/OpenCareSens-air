@@ -26,8 +26,9 @@ uint8_t check_boundary(double slope, double ycept,
 /* Simple exponential smoothing. */
 void apply_simple_smooth(double *buffer, uint16_t n, double alpha);
 
-/* Hann-window + Fourier smoothing for err16 drift detection. */
-void smooth1q_err16(const double *in, double *out, uint16_t n, uint16_t window);
+/* Regularized DFT smoother for err16 drift detection.
+ * Computes Hann-penalized spectral smoothing of n data points. */
+void smooth1q_err16(const double *in, double *out, uint16_t n);
 
 /* Error threshold calculation. */
 void cal_threshold(int16_t *n_ptr, double *mean_ptr, double *max_ptr,
