@@ -404,13 +404,30 @@ err1_done:
 
                 uint8_t crt_g0_threshold = (seq >= dev_info->err2_start_seq) ? 1 : 0;
 
+                /* CRT glu[1]: checks that BOTH current glucose AND the glucose
+                 * from kalman_delta_t steps ago exceed a higher threshold based on
+                 * err2_glu. This detects sustained very-high glucose excursions.
+                 *
+                 * Threshold = maximumValue * err2_cummax + err2_glu / err2_cummax
+                 * Lag = kalman_delta_t (5 readings = 25 minutes)
+                 *
+                 * The dual-point check (current AND lagged) ensures the glucose
+                 * has been elevated for a sustained period, not just a transient spike. */
+                double glu_thr_g1 = (double)dev_info->maximumValue * (double)dev_info->err2_cummax
+                                  + (double)dev_info->err2_glu / (double)dev_info->err2_cummax;
+                int lag_g1 = (int)dev_info->kalman_delta_t;
+                int lag_g1_idx = 287 - lag_g1;
+                uint8_t crt_g1 = (algo_args->err_glu_arr[287] > glu_thr_g1 &&
+                                  lag_g1_idx >= 0 &&
+                                  algo_args->err_glu_arr[lag_g1_idx] > glu_thr_g1) ? 1 : 0;
+
                 debug->err2_crt_current[0] = crt_c0;
                 debug->err2_crt_current[1] = crt_c1;
                 debug->err2_crt_glu[0] = crt_g0_threshold;
-                debug->err2_crt_glu[1] = 0;
+                debug->err2_crt_glu[1] = crt_g1;
 
                 debug->err2_condi[0] = (crt_c0 && crt_g0) ? 1 : 0;
-                debug->err2_condi[1] = 0;  /* crt_glu[1] is always 0, so condi[1] = 0 */
+                debug->err2_condi[1] = (crt_c1 && crt_g1) ? 1 : 0;
 
                 if (debug->err2_condi[0] || debug->err2_condi[1]) {
                     err2 = 1;
