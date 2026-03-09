@@ -177,8 +177,13 @@ double quick_median(double *arr, uint16_t n)
     uint16_t half = n / 2;
     if (n % 2 != 0)
         return quick_select(arr, n, half + 1);
-    double a = quick_select(arr, n, half);
-    double b = quick_select(arr, n, half + 1);
+    /* quick_select modifies the array in-place, so we must use a copy
+       for the second call to avoid operating on corrupted data. */
+    double tmp[1024];
+    memcpy(tmp, arr, n * sizeof(double));
+    double a = quick_select(tmp, n, half);
+    memcpy(tmp, arr, n * sizeof(double));
+    double b = quick_select(tmp, n, half + 1);
     return (a + b) * 0.5;
 }
 
