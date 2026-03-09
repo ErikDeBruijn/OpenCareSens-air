@@ -31,6 +31,24 @@ uint16_t check_error(
 {
     uint16_t errcode = 0;
 
+    /* --- FIFO maintenance: err_glu_arr and err128_CGM_c_noise_revised_value ---
+     * These rolling arrays are maintained by check_error at the start of each call.
+     * err_glu_arr[288]: shift left by 1, append round(current_glucose)
+     * err128_CGM_c_noise_revised_value[36]: shift left by 1, append tran_inA_5min
+     */
+    {
+        /* Shift err_glu_arr left by 1 element */
+        memmove(&algo_args->err_glu_arr[0], &algo_args->err_glu_arr[1],
+                287 * sizeof(double));
+        algo_args->err_glu_arr[287] = math_round(current_glucose);
+
+        /* Shift err128_CGM_c_noise_revised_value left by 1 element */
+        memmove(&algo_args->err128_CGM_c_noise_revised_value[0],
+                &algo_args->err128_CGM_c_noise_revised_value[1],
+                35 * sizeof(double));
+        algo_args->err128_CGM_c_noise_revised_value[35] = debug->tran_inA_5min;
+    }
+
     /* --- err32: timing gap detection --- */
     /* Simplest error: checks time gaps between consecutive readings */
     {
@@ -79,8 +97,54 @@ uint16_t check_error(
         double tran_5min = debug->tran_inA_5min;
 
         if (seq > dev_info->err1_seq[0]) {
+            /* Epoch reset: when n reaches err1_n_last, reset accumulators
+             * with seeded values from previous epoch's mean.
+             * Oracle-verified: at n=288 (err1_n_last), n resets to 0,
+             * th1/thd1 are seeded with (old_mean * multi), isfirst flags set. */
+            if (n >= dev_info->err1_n_last && n > 0) {
+                double mean_sse = algo_args->err1_th_sse_d_mean1 / (double)n;
+                double mean_diff = algo_args->err1_th_diff1 / (double)n;
+                double seed_sse = mean_sse * (double)dev_info->err1_multi[0];
+                double seed_diff = mean_diff * (double)dev_info->err1_multi[1];
+
+                algo_args->err1_th_sse_d_mean1 = seed_sse;
+                algo_args->err1_th_sse_d_mean2 = seed_sse;
+                algo_args->err1_th_sse_d_mean = seed_sse;
+                algo_args->err1_th_diff1 = seed_diff;
+                algo_args->err1_th_diff2 = seed_diff;
+                algo_args->err1_th_diff = seed_diff;
+
+                algo_args->err1_isfirst0 = 1;
+                algo_args->err1_isfirst1 = 1;
+                algo_args->err1_isfirst2 = 1;
+                n = 0;
+                algo_args->err1_n = 0;
+
+                /* On reset step: output seeded values and set n=0 in debug */
+                debug->err1_n = 0;
+                debug->err1_th_sse_d_mean1 = seed_sse;
+                debug->err1_th_sse_d_mean2 = seed_sse;
+                debug->err1_th_sse_d_mean = seed_sse;
+                debug->err1_th_diff1 = seed_diff;
+                debug->err1_th_diff2 = seed_diff;
+                debug->err1_th_diff = seed_diff;
+                debug->err1_isfirst0 = 1;
+                debug->err1_isfirst1 = 1;
+                debug->err1_isfirst2 = 1;
+
+                /* Store current tran_5min for next step's avg_diff */
+                algo_args->err1_i_sse_d_mean4h[99] = tran_5min;
+
+                goto err1_done;
+            }
+
             n++;
             algo_args->err1_n = n;
+
+            /* Post-reset: isfirst2 goes back to 0 after first accumulation step */
+            if (algo_args->err1_isfirst2 == 1 && n == 1) {
+                algo_args->err1_isfirst2 = 0;
+            }
 
             /* Compute i_sse_d_mean: MSE of tran_inA[30] vs linearly interpolated
              * 1-minute values. Interpolation: 6 evenly-spaced points per minute
@@ -101,30 +165,52 @@ uint16_t check_error(
                 double i_sse = sse / 30.0;
                 debug->err1_i_sse_d_mean = i_sse;
 
-                /* Accumulate th_sse_d_mean1 = cumulative sum of i_sse */
-                if (n == 1) {
-                    algo_args->err1_th_sse_d_mean1 = i_sse;
+                /* After epoch reset, th_sse_d_mean2 accumulates fresh.
+                 * th_sse_d_mean1 stays frozen at seed value. */
+                if (algo_args->err1_isfirst0) {
+                    /* Second epoch: accumulate into th_sse_d_mean2 */
+                    if (n == 1) {
+                        algo_args->err1_th_sse_d_mean2 = i_sse;
+                    } else {
+                        algo_args->err1_th_sse_d_mean2 += i_sse;
+                    }
+                    /* th_sse_d_mean stays at th_sse_d_mean1 (frozen seed) */
                 } else {
-                    algo_args->err1_th_sse_d_mean1 += i_sse;
+                    /* First epoch: accumulate into th_sse_d_mean1 */
+                    if (n == 1) {
+                        algo_args->err1_th_sse_d_mean1 = i_sse;
+                    } else {
+                        algo_args->err1_th_sse_d_mean1 += i_sse;
+                    }
+                    algo_args->err1_th_sse_d_mean = algo_args->err1_th_sse_d_mean1;
                 }
             }
 
-            /* avg_diff = tran_5min - previous tran_5min.
-             * Previous tran_5min stored in err1_i_sse_d_mean4h[99] (unused slot). */
+            /* avg_diff = tran_5min - previous tran_5min. */
             if (n == 1) {
                 debug->err1_current_avg_diff = 0.0;
-                algo_args->err1_th_diff1 = NAN;
-                algo_args->err1_th_diff2 = NAN;
-                algo_args->err1_th_diff = NAN;
+                if (!algo_args->err1_isfirst0) {
+                    algo_args->err1_th_diff1 = NAN;
+                    algo_args->err1_th_diff2 = NAN;
+                    algo_args->err1_th_diff = NAN;
+                }
+                /* In second epoch, th_diff2 goes NaN on first step */
+                if (algo_args->err1_isfirst0) {
+                    algo_args->err1_th_diff2 = NAN;
+                }
             } else {
                 double prev_tran_5min = algo_args->err1_i_sse_d_mean4h[99];
                 double avg_diff = tran_5min - prev_tran_5min;
                 debug->err1_current_avg_diff = avg_diff;
 
-                if (n == 2) {
-                    algo_args->err1_th_diff1 = fabs(avg_diff);
+                if (algo_args->err1_isfirst0) {
+                    /* Second epoch: th_diff1 frozen, not updated */
                 } else {
-                    algo_args->err1_th_diff1 += fabs(avg_diff);
+                    if (n == 2) {
+                        algo_args->err1_th_diff1 = fabs(avg_diff);
+                    } else {
+                        algo_args->err1_th_diff1 += fabs(avg_diff);
+                    }
                 }
                 algo_args->err1_th_diff = algo_args->err1_th_diff1;
 
@@ -134,13 +220,20 @@ uint16_t check_error(
             /* Store current tran_5min for next step's avg_diff */
             algo_args->err1_i_sse_d_mean4h[99] = tran_5min;
 
-            /* th_sse_d_mean = th_sse_d_mean1 in factory-cal mode */
-            algo_args->err1_th_sse_d_mean = algo_args->err1_th_sse_d_mean1;
-
             debug->err1_n = n;
+            debug->err1_isfirst0 = algo_args->err1_isfirst0;
+            debug->err1_isfirst1 = algo_args->err1_isfirst1;
+            debug->err1_isfirst2 = algo_args->err1_isfirst2;
             debug->err1_th_sse_d_mean1 = algo_args->err1_th_sse_d_mean1;
+            /* th_sse_d_mean2: only populated in second epoch (after reset).
+             * During first epoch, oracle expects NaN (set in calibration.c init). */
+            if (algo_args->err1_isfirst0) {
+                debug->err1_th_sse_d_mean2 = algo_args->err1_th_sse_d_mean2;
+            }
             debug->err1_th_sse_d_mean = algo_args->err1_th_sse_d_mean;
         }
+
+err1_done:
 
         debug->error_code1 = err1;
         debug->err1_result = err1;
@@ -267,27 +360,57 @@ uint16_t check_error(
             debug->err2_delay_roc_trimmed_mean = NAN;
             debug->err2_delay_slope_trimmed_mean = NAN;
             debug->err2_delay_glu_trimmed_mean = NAN;
-            debug->err2_cummax = NAN;
+            /* err2_cummax: cumulative max of tran_inA_5min from seq >= err2_start_seq */
+            if (seq >= dev_info->err2_start_seq) {
+                double t5 = debug->tran_inA_5min;
+                if (seq == dev_info->err2_start_seq) {
+                    algo_args->err2_cummax = t5;
+                } else {
+                    if (t5 > algo_args->err2_cummax)
+                        algo_args->err2_cummax = t5;
+                }
+                debug->err2_cummax = algo_args->err2_cummax;
+            } else {
+                debug->err2_cummax = NAN;
+            }
             debug->err2_crt_cv = NAN;
 
             /* --- CRT: Constant Rate Test --- */
-            /* Checks if the signal is "too constant" by comparing ISF arrays
-             * against thresholds. Two pairs are evaluated independently.
-             * TODO: implement actual CRT logic from binary (0x68060-0x68162).
-             * For now, stub to 0 — CRT needs ISF trend data we don't yet populate. */
+            /* Two independent criteria pairs. Each pair has a current-based
+             * and glucose-based threshold that depends on sequence position. */
             {
                 uint8_t crt_c0 = 0;
                 uint8_t crt_g0 = 0;
-                uint8_t crt_c1 = 0;
-                uint8_t crt_g1 = 0;
+
+                /* CRT current[1]: checks that BOTH current glucose AND the glucose
+                 * from err2_seq[1] steps ago exceed maximumValue * err2_cummax.
+                 *
+                 * Uses err_glu_arr (already shifted+pushed at start of check_error):
+                 *   arr[287] = round(current_glucose)
+                 *   arr[287 - err2_seq[1]] = round(glucose from err2_seq[1] steps ago)
+                 *
+                 * The lagged check naturally creates a startup delay: arr entries
+                 * are initially 0, so the lagged entry stays <= threshold until
+                 * enough readings with glucose > threshold have accumulated.
+                 *
+                 * The current-step threshold is maximumValue * cummax + cummax
+                 * to provide a small hysteresis margin above the base threshold. */
+                double glu_thr_base = (double)dev_info->maximumValue * (double)dev_info->err2_cummax;
+                double glu_thr_curr = glu_thr_base + (double)dev_info->err2_cummax;
+                int lag_idx = 287 - (int)dev_info->err2_seq[1];
+                uint8_t crt_c1 = (algo_args->err_glu_arr[287] > glu_thr_curr &&
+                                  lag_idx >= 0 &&
+                                  algo_args->err_glu_arr[lag_idx] > glu_thr_base) ? 1 : 0;
+
+                uint8_t crt_g0_threshold = (seq >= dev_info->err2_start_seq) ? 1 : 0;
 
                 debug->err2_crt_current[0] = crt_c0;
                 debug->err2_crt_current[1] = crt_c1;
-                debug->err2_crt_glu[0] = crt_g0;
-                debug->err2_crt_glu[1] = crt_g1;
+                debug->err2_crt_glu[0] = crt_g0_threshold;
+                debug->err2_crt_glu[1] = 0;
 
                 debug->err2_condi[0] = (crt_c0 && crt_g0) ? 1 : 0;
-                debug->err2_condi[1] = (crt_c1 && crt_g1) ? 1 : 0;
+                debug->err2_condi[1] = 0;  /* crt_glu[1] is always 0, so condi[1] = 0 */
 
                 if (debug->err2_condi[0] || debug->err2_condi[1]) {
                     err2 = 1;
@@ -326,24 +449,24 @@ uint16_t check_error(
             }
             debug->err4_min = algo_args->err4_min_prev[0];
 
-            /* err4_range: max - min of tran_inA_5min (using running max in slot [1]) */
-            if (seq == 2) {
-                algo_args->err4_range_prev[0] = tran_5min - algo_args->err4_min_prev[0];
-            }
-            /* For constant input, range stays 0 */
-            double range = tran_5min - algo_args->err4_min_prev[0];
-            if (range > algo_args->err4_range_prev[0])
-                algo_args->err4_range_prev[0] = range;
-            debug->err4_range = algo_args->err4_range_prev[0];
+            /* err4_range: consecutive difference (NOT max-min range).
+             * Oracle-verified: err4_range = tran_5min[n] - tran_5min[n-1].
+             * Can be negative. Name is misleading — it's the first difference. */
+            debug->err4_range = tran_5min - algo_args->err4_inA[0];
 
-            /* err4_min_diff: minimum absolute difference between consecutive tran_5min */
+            /* err4_min_diff: minimum absolute difference between consecutive tran_5min.
+             * Oracle-verified: only tracked from seq >= err345_seq2 (=5). Before that, 0. */
             double diff = fabs(tran_5min - algo_args->err4_inA[0]);
-            if (seq == 2) {
+            if (seq < dev_info->err345_seq2) {
+                debug->err4_min_diff = 0.0;
+            } else if (seq == dev_info->err345_seq2) {
                 algo_args->err4_min_diff_prev[0] = diff;
-            } else if (diff < algo_args->err4_min_diff_prev[0]) {
-                algo_args->err4_min_diff_prev[0] = diff;
+                debug->err4_min_diff = diff;
+            } else {
+                if (diff < algo_args->err4_min_diff_prev[0])
+                    algo_args->err4_min_diff_prev[0] = diff;
+                debug->err4_min_diff = algo_args->err4_min_diff_prev[0];
             }
-            debug->err4_min_diff = algo_args->err4_min_diff_prev[0];
         }
 
         /* Store current tran_5min for next step */
@@ -357,6 +480,60 @@ uint16_t check_error(
     /* --- err16: sensor drift / calibration consistency --- */
     {
         uint8_t err16 = 0;
+
+        /* err16 activates once seq >= err345_seq4[2] (typically 12).
+         * It computes smoothed glucose and current estimates using a
+         * regularized DFT smoother (smooth1q_err16) with a fixed window
+         * of 12 data points from the err_glu_arr and
+         * err128_CGM_c_noise_revised_value FIFOs.
+         *
+         * plasma = round(smooth(last 12 glu values)[11])
+         * ISF_smooth = round(smooth(last 12 current values)[11] / (slope100/100))
+         */
+        uint16_t err16_start_seq = dev_info->err345_seq4[2];
+        if (seq >= err16_start_seq) {
+            /* Number of data points for the smoother */
+            const int N = 12;
+            double glu_buf[12], curr_buf[12];
+            double smooth_glu[12], smooth_curr[12];
+
+            /* Extract last N elements from err_glu_arr[288] */
+            for (int i = 0; i < N; i++)
+                glu_buf[i] = algo_args->err_glu_arr[288 - N + i];
+
+            /* Extract last N elements from err128_CGM_c_noise_revised_value[36] */
+            for (int i = 0; i < N; i++)
+                curr_buf[i] = algo_args->err128_CGM_c_noise_revised_value[36 - N + i];
+
+            /* Run regularized DFT smoother on both buffers */
+            smooth1q_err16(glu_buf, smooth_glu, N);
+            smooth1q_err16(curr_buf, smooth_curr, N);
+
+            /* Compute plasma and ISF_smooth from smoothed values */
+            double slope100_d = (double)dev_info->slope100;
+            double conv_factor = slope100_d / 100.0;
+
+            /* Check that data is valid (no NaN/Inf in the smoothed output) */
+            double sm_glu_last = smooth_glu[N - 1];
+            double sm_curr_last = smooth_curr[N - 1];
+
+            int valid = 1;
+            if (isnan(sm_glu_last) || isinf(sm_glu_last)) valid = 0;
+            if (isnan(sm_curr_last) || isinf(sm_curr_last)) valid = 0;
+            if (fabs(sm_glu_last) == 0.0 && fabs(sm_curr_last) == 0.0) valid = 0;
+
+            if (valid && conv_factor > 0.0) {
+                debug->err16_CGM_plasma = math_round(sm_glu_last);
+                debug->err16_CGM_ISF_smooth = math_round(sm_curr_last / conv_factor);
+            } else {
+                debug->err16_CGM_plasma = NAN;
+                debug->err16_CGM_ISF_smooth = NAN;
+            }
+        } else {
+            debug->err16_CGM_plasma = NAN;
+            debug->err16_CGM_ISF_smooth = NAN;
+        }
+
         debug->error_code16 = err16;
         if (err16) errcode |= 16;
         algo_args->err16_result_prev = err16;
