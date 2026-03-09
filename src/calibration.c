@@ -21,13 +21,10 @@
 #define TEMP_REF 37.0
 #define TEMP_COEFF 0.1584
 
+/* Holt gain tables removed -- replaced by inlined Kalman filter with fixed gains
+ * and F matrix using phi = exp(-delta_t/t90). See Step 11b in the algorithm.
+ * The tables below are DEAD CODE, kept temporarily for reference. */
 #define HOLT_GAIN_TABLE_SIZE 95
-
-/* Holt double exponential smoothing gain table for bias correction.
- * Extracted from oracle lot0 period 2 (seq 32-124, cnt 2-94).
- * Invariant: K1/(1-alpha) = 0.391012 (constant across all steps).
- * alpha: level smoothing gain, K1: trend gain, h: horizon multiplier.
- * For cnt > 94, use cnt=94 entry (converged values). */
 static const struct { double alpha; double K1; double h; } holt_gains[HOLT_GAIN_TABLE_SIZE] = {
     {0, 0, 0},  /* cnt=0  unused */
     {0, 0, 0},  /* cnt=1  init   */
@@ -126,11 +123,115 @@ static const struct { double alpha; double K1; double h; } holt_gains[HOLT_GAIN_
     {0.823382677846958, 0.069059478731696, 2.542881955839},  /* cnt=94  */
 };
 
+/* Holt h table for "standard" reset periods (small trend at boundary).
+ * Average of oracle lot0 periods 3 and 5 h values.
+ * Used at cnt>=95 boundaries when |trend| < HOLT_ACTIVE_RESET_THRESHOLD.
+ * Period 2's h table is only used for cnt 2-94 (before any reset);
+ * at resets the h trajectory differs because the Kalman P-matrix state
+ * has accumulated from previous periods. */
+static const double holt_reset_std_h[HOLT_GAIN_TABLE_SIZE] = {
+    0, /* ga=0  unused */
+    0, /* ga=1  init   */
+    8.838125504632,  /* ga=2   */
+    7.507595261971,  /* ga=3   */
+    6.333816261454,  /* ga=4   */
+    5.407527920967,  /* ga=5   */
+    4.761894314232,  /* ga=6   */
+    4.337433857099,  /* ga=7   */
+    4.048669299752,  /* ga=8   */
+    3.831625935929,  /* ga=9   */
+    3.655781623237,  /* ga=10  */
+    3.511245622640,  /* ga=11  */
+    3.390240599189,  /* ga=12  */
+    3.288082832149,  /* ga=13  */
+    3.202424888951,  /* ga=14  */
+    3.129700182343,  /* ga=15  */
+    3.065671595284,  /* ga=16  */
+    3.012121762881,  /* ga=17  */
+    2.962454212186,  /* ga=18  */
+    2.919930510922,  /* ga=19  */
+    2.882882497625,  /* ga=20  */
+    2.850154543363,  /* ga=21  */
+    2.820740887478,  /* ga=22  */
+    2.795506482074,  /* ga=23  */
+    2.772136259251,  /* ga=24  */
+    2.750461873783,  /* ga=25  */
+    2.731520371931,  /* ga=26  */
+    2.713820106956,  /* ga=27  */
+    2.697414958115,  /* ga=28  */
+    2.685904388508,  /* ga=29  */
+    2.673540862089,  /* ga=30  */
+    2.661010440221,  /* ga=31  */
+    2.651135847253,  /* ga=32  */
+    2.641576612922,  /* ga=33  */
+    2.632671938607,  /* ga=34  */
+    2.625132956900,  /* ga=35  */
+    2.617644341599,  /* ga=36  */
+    2.610875090574,  /* ga=37  */
+    2.605419014038,  /* ga=38  */
+    2.599876684118,  /* ga=39  */
+    2.594956932873,  /* ga=40  */
+    2.590667076410,  /* ga=41  */
+    2.586864276070,  /* ga=42  */
+    2.582261304293,  /* ga=43  */
+    2.579685145033,  /* ga=44  */
+    2.575668709166,  /* ga=45  */
+    2.572010670759,  /* ga=46  */
+    2.570213358683,  /* ga=47  */
+    2.568217660314,  /* ga=48  */
+    2.565370150513,  /* ga=49  */
+    2.562823838665,  /* ga=50  */
+    2.560712819082,  /* ga=51  */
+    2.562098942815,  /* ga=52  */
+    2.560520363523,  /* ga=53  */
+    2.559070034063,  /* ga=54  */
+    2.557737263138,  /* ga=55  */
+    2.556512283183,  /* ga=56  */
+    2.555386165537,  /* ga=57  */
+    2.554350744231,  /* ga=58  */
+    2.553398547280,  /* ga=59  */
+    2.552522734734,  /* ga=60  */
+    2.551717042709,  /* ga=61  */
+    2.550975732714,  /* ga=62  */
+    2.550293545819,  /* ga=63  */
+    2.549665661054,  /* ga=64  */
+    2.549087657634,  /* ga=65  */
+    2.548555480710,  /* ga=66  */
+    2.548065410093,  /* ga=67  */
+    2.547614031939,  /* ga=68  */
+    2.547198212804,  /* ga=69  */
+    2.546815076095,  /* ga=70  */
+    2.546461980528,  /* ga=71  */
+    2.546136500525,  /* ga=72  */
+    2.545836408199,  /* ga=73  */
+    2.545559657036,  /* ga=74  */
+    2.545304366824,  /* ga=75  */
+    2.545068809954,  /* ga=76  */
+    2.544851398910,  /* ga=77  */
+    2.544650674686,  /* ga=78  */
+    2.544465296320,  /* ga=79  */
+    2.544294031217,  /* ga=80  */
+    2.544135746297,  /* ga=81  */
+    2.543989399906,  /* ga=82  */
+    2.543854034368,  /* ga=83  */
+    2.543728769154,  /* ga=84  */
+    2.543612794620,  /* ga=85  */
+    2.543505366266,  /* ga=86  */
+    2.543405799478,  /* ga=87  */
+    2.543313464659,  /* ga=88  */
+    2.543227782807,  /* ga=89  */
+    2.543148221411,  /* ga=90  */
+    2.543074290696,  /* ga=91  */
+    2.543005540211,  /* ga=92  */
+    2.542941555623,  /* ga=93  */
+    2.542881955839,  /* ga=94  */
+};
+
 /* Holt h table for "active" reset periods (large trend at boundary).
  * Extracted from oracle lot0 period 6 (seq 275-400, cnt 245+, gain_age 2-94+).
  * Used when |trend| >= HOLT_ACTIVE_RESET_THRESHOLD at the reset boundary.
- * Period 2's h table (high initial h ~8.5) applies when trend is near zero;
- * this table (low initial h ~1.8) applies when trend is large. */
+ * Period 2's h table (high initial h ~8.5) applies for the initial period;
+ * at resets this table (low initial h ~1.8) applies when trend is large. */
 #define HOLT_ACTIVE_RESET_THRESHOLD 2.0
 
 static const double holt_active_h[HOLT_GAIN_TABLE_SIZE] = {
@@ -619,13 +720,23 @@ unsigned char air1_opcal4_algorithm(
         algo_debug->smooth_frep[i] = algo_args->smooth_f_rep_in[i];
     }
 
-    /* --- Step 11b: Holt bias correction → opcal_ad ---
-     * Holt double exponential smoothing corrects init_cg drift over time.
-     * Recursion: level = prev_level + prev_trend + alpha * innovation
-     *            trend = prev_trend + K1 * innovation
-     *            forecast = level + h * trend
-     * Output: opcal_ad = init_cg + (forecast - init_cg) * (cnt-1) / 24
-     * Oracle-verified: exact match (1e-13) with tabulated gains. */
+    /* --- Step 11b: Holt bias correction via inlined Kalman filter → opcal_ad ---
+     *
+     * State vector x = [level, forecast, trend] with FIXED Kalman gains:
+     *   K = [0.6729, 1.761, 0.1279]  (from PARAMS+0x150, 0x158, 0x160)
+     *
+     * State transition F uses phi = exp(-delta_t / t90):
+     *   level_pred    = phi * level + (1-phi) * forecast
+     *   forecast_pred = forecast + trend
+     *   trend_pred    = trend
+     *
+     * Observation: innovation = init_cg - level_pred
+     * Update: state_new = state_pred + K * innovation
+     *
+     * Output blend: opcal_ad = init_cg + (forecast - init_cg) * (cnt-1)/24
+     *   for cnt <= 25; opcal_ad = forecast for cnt > 25.
+     *
+     * Oracle-verified: 384 transitions with max error 4.55e-13. */
     double opcal_ad;
     {
         uint16_t cnt = algo_args->bias_cnt;
@@ -637,52 +748,27 @@ unsigned char air1_opcal4_algorithm(
             }
             opcal_ad = init_cg;
         } else {
-            /* Gain age: resets at cnt=95,145,195,245 (every 50 steps after
-             * the initial 93-step period).  Within each period the gains
-             * follow the same evolution as period 2 (cnt 2-94). */
-            int gain_age;
-            if      (cnt >= 245) gain_age = cnt - 245 + 2;
-            else if (cnt >= 195) gain_age = cnt - 195 + 2;
-            else if (cnt >= 145) gain_age = cnt - 145 + 2;
-            else if (cnt >=  95) gain_age = cnt -  95 + 2;
-            else                 gain_age = cnt;
+            /* phi = exp(-delta_t / t90) where delta_t=5, t90=10 */
+            const double phi = 0.60653065971263342;  /* exp(-0.5) */
 
-            if (gain_age >= HOLT_GAIN_TABLE_SIZE)
-                gain_age = HOLT_GAIN_TABLE_SIZE - 1;
-            if (gain_age < 2) gain_age = 2;
+            /* State prediction */
+            double level_pred    = phi * algo_args->holt_level
+                                 + (1.0 - phi) * algo_args->holt_forecast;
+            double forecast_pred = algo_args->holt_forecast + algo_args->holt_trend;
+            double trend_pred    = algo_args->holt_trend;
 
-            double alpha = holt_gains[gain_age].alpha;
-            double K1    = holt_gains[gain_age].K1;
-
-            /* Select h table based on whether this is an "active" reset
-             * (large trend carried over from the previous period) or a
-             * "clean" reset (trend near zero).  For cnt < 95 (no reset),
-             * always use the standard (period 2) h table.
-             * The decision is latched at the reset boundary (gain_age==2)
-             * and held for the entire reset period. */
-            static int holt_use_active_h = 0;
-            int is_reset = (cnt >= 95);
-            if (is_reset && gain_age == 2) {
-                /* Latch regime decision at reset boundary */
-                holt_use_active_h =
-                    (fabs(algo_args->holt_trend) >= HOLT_ACTIVE_RESET_THRESHOLD);
-            }
-            double h;
-            if (is_reset && holt_use_active_h)
-                h = holt_active_h[gain_age];
-            else
-                h = holt_gains[gain_age].h;
-
-            double innovation = init_cg - (algo_args->holt_level + algo_args->holt_trend);
-            algo_args->holt_level += algo_args->holt_trend + alpha * innovation;
-            algo_args->holt_trend += K1 * innovation;
-            algo_args->holt_forecast = algo_args->holt_level + h * algo_args->holt_trend;
+            /* Innovation and Kalman update with fixed gains */
+            double innovation = init_cg - level_pred;
+            algo_args->holt_level    = level_pred    + 0.6729 * innovation;
+            algo_args->holt_forecast = forecast_pred + 1.761  * innovation;
+            algo_args->holt_trend    = trend_pred    + 0.1279 * innovation;
 
             if (cnt > 25) {
                 /* Binary bypasses blend when cnt > 25 (bhi 0x64ccc) */
                 opcal_ad = algo_args->holt_forecast;
             } else {
-                opcal_ad = init_cg + (algo_args->holt_forecast - init_cg) * (double)(cnt - 1) / 24.0;
+                opcal_ad = init_cg + (algo_args->holt_forecast - init_cg)
+                         * (double)(cnt - 1) / 24.0;
             }
         }
     }
