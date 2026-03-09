@@ -7,6 +7,7 @@ vendor/decompiled_java/
 vendor/decompiled_c/
 vendor/disasm/
 vendor/ghidra_project/
+vendor/symbol_table.txt
 
 # Build artifacts
 build/
@@ -14,11 +15,27 @@ build/
 *.so
 *.a
 
+# Oracle output files (generated from proprietary library)
+# Source files (oracle/*.c, oracle/Makefile, oracle/run_oracle.sh) ARE tracked.
+oracle/output/
+oracle/build/
+oracle/oracle_harness_arm
+oracle/oracle_harness_static
+oracle/android_sysroot/
+oracle/syslibs*/
+
+# Backup files
+*.bak
+
 # IDE
 .idea/
 .vscode/
 *.swp
 *~
+
+# Python cache
+__pycache__/
+*.pyc
 
 # OS
 .DS_Store

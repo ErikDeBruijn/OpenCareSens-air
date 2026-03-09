@@ -1,0 +1,8 @@
+FROM --platform=linux/arm64 debian:bookworm-slim
+
+# Install qemu-arm (32-bit ARM user-mode emulator) and build tools
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    qemu-user \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /oracle

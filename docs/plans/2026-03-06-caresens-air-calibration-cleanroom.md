@@ -106,10 +106,10 @@ A 1 mg/dL glucose difference at a threshold boundary can flip an error code bit,
 | `/Users/erik/github.com/j-kaltes/Juggluco/Common/src/main/cpp/air/air.hpp` | All struct definitions (753 lines) |
 | `/Users/erik/github.com/j-kaltes/Juggluco/Common/src/main/cpp/air/java.cpp` | How Juggluco calls the algorithm via dlopen/dlsym |
 | `/Users/erik/github.com/j-kaltes/Juggluco/Common/src/dex/java/tk/glucodata/AirGattCallback.java` | BLE protocol (UUIDs, authentication, commands) |
-| `vendor/decompiled_c/all_functions.c` | Ghidra decompiled C (partial — math utils OK, complex functions truncated) |
-| `vendor/decompiled_java/sources/com/isens/airsdk/module/type/DebugData4Obj.java` | Debug struct field names and byte layout |
+| `vendor/decompiled_c/all_functions.c` | Ghidra decompiled C (partial — math utils OK, complex functions truncated, from original analysis) |
+| `vendor/decompiled/sources/com/isens/airsdk/module/type/DebugData4Obj.java` | Debug struct field names and byte layout |
 | `vendor/native/lib/armeabi-v7a/libCALCULATION.so` | Proprietary library (ARM 32-bit, not stripped, with debug_info) |
-| `vendor/disasm/*.asm` | **Complete ARM Thumb-2 disassembly** of all key functions |
+| `reference/disasm/*.asm` | **Complete ARM Thumb-2 disassembly** of all key functions |
 
 ### Complete function map (opcal4)
 
@@ -198,7 +198,7 @@ The algorithm determines `lot_type` (0, 1, or 2) from `device_info.eapp` on the 
 
 For each function that Ghidra couldn't decompile:
 
-1. **Feed LLM the ARM disassembly** (from `vendor/disasm/`)
+1. **Feed LLM the ARM disassembly** (from `reference/disasm/`)
 2. **Feed LLM the function signature** (from Ghidra prologue or llvm-nm)
 3. **Feed LLM the local variable names** (from Ghidra stack frame analysis)
 4. **Feed LLM the struct definitions** (from `air.hpp`)
@@ -373,7 +373,7 @@ Inlined in main function. Default `drift_correction_on=0` means pass-through for
 
 ### Task 14: Kalman filter (fun_linear_kalman)
 
-**Disassembly:** `vendor/disasm/fun_linear_kalman.asm` (583 instructions — this is the **opcal1** variant)
+**Disassembly:** `reference/disasm/fun_linear_kalman.asm` (583 instructions — this is the **opcal1** variant)
 **Oracle fields:** `debug.state_init_kalman`, `debug.out_rescale`
 
 **CRITICAL:** Do NOT use textbook Kalman. The `kalman_q_x100[0][0] = -115` indicates a non-standard modification. Use the ARM disassembly to understand the actual algorithm.
@@ -391,14 +391,14 @@ Inlined in main function. Default `drift_correction_on=0` means pass-through for
 
 ### Task 15: Savitzky-Golay smoothing (smooth_sg)
 
-**Disassembly:** `vendor/disasm/smooth_sg_opcal4.asm` (111 instructions)
+**Disassembly:** `reference/disasm/smooth_sg_opcal4.asm` (111 instructions)
 **Oracle fields:** `debug.smooth_sig[6]`, `debug.smooth_seq[6]`, `debug.smooth_frep[6]`
 
 At 111 instructions, this is small enough that LLM transpilation should be near-perfect on first attempt.
 
 ### Task 16: regress_cal (weighted least-squares recalibration)
 
-**Disassembly:** `vendor/disasm/regress_cal_opcal4.asm` (462 instructions)
+**Disassembly:** `reference/disasm/regress_cal_opcal4.asm` (462 instructions)
 **Oracle fields:** `debug.cal_slope[7]`, `debug.cal_ycept[7]`
 
 **Local variables from Ghidra:** `x[60]`, `y[60]`, `X[60][2]`, `w[60]`, `XtX[2][2]`, `Xty[2]`, `r[60]`, `abs_r[60]`, `xtwx[2][2]`, `xtwy[2]`, `gauss_var` — confirms IRLS weighted regression.
@@ -417,7 +417,7 @@ At 111 instructions, this is small enough that LLM transpilation should be near-
 
 ## Phase 3: Error Detection (check_error — the big one)
 
-**Disassembly:** `vendor/disasm/check_error.asm` (8008 instructions, 24,948 bytes)
+**Disassembly:** `reference/disasm/check_error.asm` (8008 instructions, 24,948 bytes)
 
 This is one massive function containing ALL error detection logic. It is 3× larger than the entire signal processing pipeline. Plan accordingly.
 

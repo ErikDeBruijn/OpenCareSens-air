@@ -26,8 +26,8 @@ static int failures = 0;
 int main(void) {
     printf("=== Struct size verification ===\n\n");
 
-    CHECK_SIZE(air1_opcal4_cal_log_t,       81);
-    CHECK_SIZE(air1_opcal4_arguments_t,     116030);
+    CHECK_SIZE(air1_opcal4_cal_log_t,       104);  /* natural alignment (8-byte doubles) */
+    CHECK_SIZE(air1_opcal4_arguments_t,     117312); /* oracle-verified: natural alignment */
     CHECK_SIZE(air1_opcal4_output_t,        155);
     CHECK_SIZE(air1_opcal4_debug_t,         1579);
     CHECK_SIZE(air1_opcal4_device_info_t,   446);
