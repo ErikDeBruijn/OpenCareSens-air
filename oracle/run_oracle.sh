@@ -8,15 +8,26 @@
 #   - Cross-compiled harness at oracle/oracle_harness_arm
 #
 # Usage:
-#   ./run_oracle.sh                          # All 3 lot types, 400 readings each
+#   ./run_oracle.sh                          # All lots, 400 readings each
 #   ./run_oracle.sh --lot 0 --readings 50    # Quick test, lot 0 only
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
-LOT_TYPES=(0 1 2)
+# Lot definitions: each lot has an eapp value and a glucose profile
+# Format: "eapp:profile"
+#   eapp: sensor parameter affecting ADC→current conversion
+#   profile: 0=normal, 1=hypo, 2=hyper
+LOT_DEFS=(
+    "0.10067:0"   # lot0: standard eapp, normal glucose range
+    "0.15:0"      # lot1: high eapp, normal glucose range
+    "0.05:0"      # lot2: low eapp, normal glucose range (triggers err2)
+    "0.10067:1"   # lot3: standard eapp, hypoglycemia scenario
+    "0.10067:2"   # lot4: standard eapp, hyperglycemia scenario
+)
+
+LOT_TYPES=(0 1 2 3 4)
 READINGS=400
-EAPP_MAP=(0.10067 0.15 0.05)
 
 # Parse args
 while [[ $# -gt 0 ]]; do
@@ -40,12 +51,14 @@ fi
 SO_PATH="$(cd ../vendor/native/lib/armeabi-v7a && pwd)/libCALCULATION.so"
 
 for lot_num in "${LOT_TYPES[@]}"; do
-    eapp=${EAPP_MAP[$lot_num]}
+    lot_def=${LOT_DEFS[$lot_num]}
+    eapp=${lot_def%%:*}
+    profile=${lot_def##*:}
     outdir="output/lot${lot_num}"
     rm -rf "$outdir"
     mkdir -p "$outdir"
 
-    echo "=== Lot $lot_num (eapp=$eapp, $READINGS readings) ==="
+    echo "=== Lot $lot_num (eapp=$eapp, profile=$profile, $READINGS readings) ==="
     docker run --rm --platform linux/arm/v7 \
         -v "$(pwd)/android_sysroot/system:/system:ro" \
         -v "$(pwd)/oracle_harness_arm:/oracle/oracle_harness:ro" \
@@ -56,9 +69,10 @@ for lot_num in "${LOT_TYPES[@]}"; do
             --so /oracle/libCALCULATION.so \
             --output /oracle/output \
             --readings "$READINGS" \
-            --eapp "$eapp" 2>&1 | tail -5
+            --eapp "$eapp" \
+            --profile "$profile" 2>&1 | tail -5
     echo ""
 done
 
-echo "Oracle data saved to output/lot{0,1,2}/"
+echo "Oracle data saved to output/lot{0..4}/"
 echo "Parse with: python3 ../tools/parse_oracle.py output/lot0 [seq]"

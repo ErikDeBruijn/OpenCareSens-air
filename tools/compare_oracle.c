@@ -525,11 +525,9 @@ int main(int argc, char **argv) {
         dev_info.eapp = eapp_override;
         printf("Using eapp override: %f\n", eapp_override);
     } else {
-        /* Auto-detect eapp from directory name (lot0/lot1/lot2) */
-        /* Matches EAPP_MAP in oracle/run_oracle.sh:
-         *   lot0 -> 0.10067, lot1 -> 0.15, lot2 -> 0.05 */
+        /* Auto-detect eapp from directory name (lot0..lot4) */
+        /* Matches LOT_DEFS in oracle/run_oracle.sh */
         const char *dir = oracle_dir;
-        /* Find the last path component */
         const char *last_slash = strrchr(dir, '/');
         const char *basename = last_slash ? last_slash + 1 : dir;
         if (strcmp(basename, "lot1") == 0) {
@@ -539,7 +537,8 @@ int main(int argc, char **argv) {
             dev_info.eapp = 0.05f;
             printf("Auto-detected lot2: eapp=0.05\n");
         } else {
-            printf("Using default eapp=0.10067 (lot0)\n");
+            /* lot0, lot3, lot4 all use default eapp=0.10067 */
+            printf("Using default eapp=0.10067 (%s)\n", basename);
         }
     }
 

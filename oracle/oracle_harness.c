@@ -203,29 +203,74 @@ static int write_binary(const char *path, const void *data, size_t size) {
 }
 
 /*
- * Test scenario: a complete glucose session
- * - 24 warmup readings (glucose ~100 mg/dL)
- * - 100 stable readings (~120 mg/dL)
- * - 50 rising readings (120→200 mg/dL)
- * - 50 stable high readings (~200 mg/dL)
- * - 50 falling readings (200→100 mg/dL)
- * - 126 stable readings (~100 mg/dL)
- * Total: 400 readings
+ * Profile 0: Normal range (original)
+ * - 24 warmup (~100), 100 stable (120), 50 rising (120→200),
+ *   50 stable high (200), 50 falling (200→100), 126 stable low (100)
  */
-static double glucose_profile(int seq) {
-    if (seq <= 24) return 100.0;                           /* warmup */
-    if (seq <= 124) return 120.0;                          /* stable normal */
-    if (seq <= 174) return 120.0 + (seq - 124) * 1.6;     /* rising */
-    if (seq <= 224) return 200.0;                          /* stable high */
-    if (seq <= 274) return 200.0 - (seq - 224) * 2.0;     /* falling */
-    return 100.0;                                          /* stable low */
+static double glucose_profile_normal(int seq) {
+    if (seq <= 24) return 100.0;
+    if (seq <= 124) return 120.0;
+    if (seq <= 174) return 120.0 + (seq - 124) * 1.6;
+    if (seq <= 224) return 200.0;
+    if (seq <= 274) return 200.0 - (seq - 224) * 2.0;
+    return 100.0;
 }
+
+/*
+ * Profile 1: Hypoglycemia scenario
+ * - 24 warmup (~90), 50 stable normal (100), 40 gradual drop (100→45),
+ *   60 sustained hypo (42-48 oscillating), 40 slow recovery (45→90),
+ *   30 overshoot (90→150), 30 settle (150→110), 126 stable (110)
+ */
+static double glucose_profile_hypo(int seq) {
+    if (seq <= 24) return 90.0;                              /* warmup */
+    if (seq <= 74) return 100.0;                             /* stable normal */
+    if (seq <= 114) return 100.0 - (seq - 74) * 1.375;      /* dropping 100→45 */
+    if (seq <= 174) {                                        /* sustained hypo with oscillation */
+        double base = 45.0;
+        double osc = 3.0 * sin((seq - 114) * 0.3);          /* ±3 mg/dL wobble */
+        return base + osc;
+    }
+    if (seq <= 214) return 45.0 + (seq - 174) * 1.125;      /* recovery 45→90 */
+    if (seq <= 244) return 90.0 + (seq - 214) * 2.0;        /* overshoot 90→150 */
+    if (seq <= 274) return 150.0 - (seq - 244) * 1.333;     /* settle 150→110 */
+    return 110.0;                                            /* stable */
+}
+
+/*
+ * Profile 2: Hyperglycemia scenario
+ * - 24 warmup (~120), 30 stable (130), 50 rapid rise (130→380),
+ *   80 sustained high (380-420 oscillating), 50 sharp drop (400→180),
+ *   40 gradual drop (180→100), 126 stable (100)
+ */
+static double glucose_profile_hyper(int seq) {
+    if (seq <= 24) return 120.0;                             /* warmup */
+    if (seq <= 54) return 130.0;                             /* stable */
+    if (seq <= 104) return 130.0 + (seq - 54) * 5.0;        /* rapid rise 130→380 */
+    if (seq <= 184) {                                        /* sustained high with oscillation */
+        double base = 400.0;
+        double osc = 20.0 * sin((seq - 104) * 0.15);        /* ±20 mg/dL wobble */
+        return base + osc;
+    }
+    if (seq <= 234) return 400.0 - (seq - 184) * 4.4;       /* sharp drop 400→180 */
+    if (seq <= 274) return 180.0 - (seq - 234) * 2.0;       /* gradual drop 180→100 */
+    return 100.0;                                            /* stable low */
+}
+
+typedef double (*glucose_profile_fn)(int seq);
+static glucose_profile_fn glucose_profiles[] = {
+    glucose_profile_normal,
+    glucose_profile_hypo,
+    glucose_profile_hyper,
+};
+#define NUM_PROFILES 3
 
 int main(int argc, char **argv) {
     const char *so_path = "./libCALCULATION.so";
     const char *output_dir = "./output";
     int num_readings = 400;
     float eapp_override = 0.0f; /* 0 = use default */
+    int profile = 0; /* glucose profile: 0=normal, 1=hypo, 2=hyper */
     int shift_m2_override[3] = {-1, -1, -1}; /* -1 = use default */
     int slope_factor_override = -1;
     int correct1_override = -1;
@@ -240,6 +285,13 @@ int main(int argc, char **argv) {
             num_readings = atoi(argv[++i]);
         else if (strcmp(argv[i], "--eapp") == 0 && i+1 < argc)
             eapp_override = (float)atof(argv[++i]);
+        else if (strcmp(argv[i], "--profile") == 0 && i+1 < argc) {
+            profile = atoi(argv[++i]);
+            if (profile < 0 || profile >= NUM_PROFILES) {
+                fprintf(stderr, "ERROR: profile must be 0-%d\n", NUM_PROFILES - 1);
+                return 1;
+            }
+        }
         else if (strcmp(argv[i], "--shift_m2_0") == 0 && i+1 < argc)
             shift_m2_override[0] = atoi(argv[++i]);
         else if (strcmp(argv[i], "--shift_m2_1") == 0 && i+1 < argc)
@@ -251,7 +303,8 @@ int main(int argc, char **argv) {
         else if (strcmp(argv[i], "--correct1") == 0 && i+1 < argc)
             correct1_override = atoi(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0) {
-            printf("Usage: %s [--so path] [--output dir] [--readings N] [--eapp val] [--shift_m2_0 N] [--shift_m2_1 N] [--shift_m2_2 N]\n", argv[0]);
+            printf("Usage: %s [--so path] [--output dir] [--readings N] [--eapp val] [--profile 0|1|2] [--shift_m2_0 N]\n", argv[0]);
+            printf("  Profiles: 0=normal, 1=hypo, 2=hyper\n");
             return 0;
         }
     }
@@ -339,7 +392,7 @@ int main(int argc, char **argv) {
         cgm_input.measurement_time_standard = base_time + seq * 300; /* 5 min intervals */
         cgm_input.temperature = 36.5; /* body temperature in °C */
 
-        double target_glucose = glucose_profile(seq);
+        double target_glucose = glucose_profiles[profile](seq);
         generate_adc_readings(cgm_input.workout, target_glucose,
                               dev_info.vref, dev_info.eapp, dev_info.slope100);
 
