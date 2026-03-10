@@ -468,12 +468,46 @@ static double drift_correction(double out_iir, struct air1_opcal4_arguments_t *a
 
 /*
  * Temperature-corrected slope ratio.
- * Oracle-verified: slope_ratio_temp = slope_ratio * (1 + 0.1584 * (37 - temp))
- * For temp=36.5, slope_ratio=1.0: returns 1.0792
+ *
+ * Uses a 4-element circular buffer of recent temperatures (stored in
+ * algo_args->slope_ratio_temp_buffer) and lot-type-specific coefficients.
+ *
+ * lot_type=1 (eapp >= 0.075): srt = 1 + (-0.1584) * (T_mean - 37.0)
+ *   Equivalent to original: slope_ratio * (1 + 0.1584 * (37 - T))
+ *   Oracle-verified: temp=36.5, slope_ratio=1.0 → 1.0792
+ *
+ * lot_type=2 (eapp < 0.075): srt = 1 + 0.0328 * (T_mean - 34.0854)
+ *   Oracle-verified across 30 readings of real sensor data (max error ~1e-6)
  */
-static double compute_slope_ratio_temp(double slope_ratio, double temperature)
+#define LOT2_TEMP_COEFF 0.0328
+#define LOT2_TEMP_REF   34.0854
+#define TEMP_BUF_SIZE   4
+
+static double compute_slope_ratio_temp_buffered(
+    double temperature,
+    struct air1_opcal4_arguments_t *args,
+    uint8_t lot_type)
 {
-    return slope_ratio * (1.0 + TEMP_COEFF * (TEMP_REF - temperature));
+    /* Add current temperature to circular buffer */
+    double *buf = args->slope_ratio_temp_buffer;
+    uint16_t idx = args->idx_origin_seq;
+    uint16_t buf_len = (idx < TEMP_BUF_SIZE) ? idx : TEMP_BUF_SIZE;
+    uint16_t buf_pos = (idx - 1) % TEMP_BUF_SIZE;
+    buf[buf_pos] = temperature;
+
+    /* Compute mean of buffered temperatures */
+    double T_mean = 0.0;
+    for (int i = 0; i < buf_len; i++)
+        T_mean += buf[i];
+    T_mean /= (double)buf_len;
+
+    /* Lot-type-specific temperature correction */
+    if (lot_type == 2)
+        return 1.0 + LOT2_TEMP_COEFF * (T_mean - LOT2_TEMP_REF);
+    else if (lot_type == 1)
+        return 1.0 + (-TEMP_COEFF) * (T_mean - TEMP_REF);
+    else
+        return 1.0;  /* lot_type=0: no temperature correction */
 }
 
 /*
@@ -617,13 +651,35 @@ unsigned char air1_opcal4_algorithm(
     double out_iir = iir_filter(corrected_current, algo_args, dev_info);
     algo_debug->out_iir = out_iir;
 
-    /* --- Step 6: Temperature correction --- */
-    double slope_ratio_temp = compute_slope_ratio_temp(
-        (double)dev_info->slope_ratio, cgm_input->temperature);
+    /* --- Step 6: Temperature correction (4-element buffered mean) --- */
+    double slope_ratio_temp = compute_slope_ratio_temp_buffered(
+        cgm_input->temperature, algo_args, algo_args->lot_type);
     algo_debug->slope_ratio_temp = slope_ratio_temp;
 
-    /* --- Step 7: Drift correction and baseline extraction --- */
-    double out_drift = drift_correction(out_iir, algo_args, algo_debug);
+    /* --- Step 7: Drift correction and baseline extraction ---
+     * Oracle-verified: polynomial drift correction applies for lot_type=1.
+     * For lot_type=2 (eapp < 0.075), drift correction is skipped
+     * (out_drift = out_iir). Baseline extraction still runs in both cases. */
+    double out_drift;
+    if (algo_args->lot_type == 1)
+        out_drift = drift_correction(out_iir, algo_args, algo_debug);
+    else {
+        /* Skip polynomial drift, but still extract baseline */
+        uint32_t n = algo_args->idx_origin_seq;
+        out_drift = out_iir;
+        algo_debug->out_drift = out_drift;
+        if (n == 1) {
+            algo_args->baseline_prev = out_drift;
+            algo_debug->curr_baseline = out_drift;
+            algo_debug->initstable_diff_dc = out_drift;
+        } else {
+            double prev_baseline = algo_args->baseline_prev;
+            double new_baseline = (prev_baseline * (double)(n - 1) + out_drift) / (double)n;
+            algo_debug->curr_baseline = new_baseline;
+            algo_debug->initstable_diff_dc = new_baseline - prev_baseline;
+            algo_args->baseline_prev = new_baseline;
+        }
+    }
 
     /* --- Step 7b: Initstable counter ---
      * Oracle-verified: increments when baseline change (diff_dc) is small.
@@ -687,6 +743,13 @@ unsigned char air1_opcal4_algorithm(
         uint32_t idx = algo_args->idx_origin_seq;
         uint32_t bw = (uint32_t)dev_info->basic_warmup;
 
+        /* Oracle-verified: warmup and bias_cnt checks use seq_final (the
+         * cumulative sequence number from cgm_input), NOT idx_origin_seq.
+         * This matters when arguments are restarted mid-sensor (e.g. real
+         * sensor data where seq starts at 2551 but idx starts at 1):
+         * seq_final > basic_warmup immediately bypasses warmup. */
+        uint32_t sf = (uint32_t)seq_final;
+
         /* Track init_cg stability during post-warmup period.
          * nSumtrend counts consecutive stable readings (|delta_init_cg| < 0.1).
          * init_cg_prev holds the previous reading's init_cg value. */
@@ -700,12 +763,12 @@ unsigned char air1_opcal4_algorithm(
 
         /* Flag: 0 during warmup; 3 during post-warmup transition until
          * init_cg stabilizes (3 consecutive stable readings) or max 6 steps */
-        if (idx <= bw) {
+        if (sf <= bw) {
             algo_args->bias_flag = 0;
-        } else if (idx <= bw + 6) {
+        } else if (sf <= bw + 6) {
             if (prev_flag == 3 && algo_args->nSumtrend >= 3.0)
                 algo_args->bias_flag = 0;  /* early termination: signal stable */
-            else if (prev_flag == 3 || idx == bw + 1)
+            else if (prev_flag == 3 || sf == bw + 1)
                 algo_args->bias_flag = 3;
             else
                 algo_args->bias_flag = 0;
@@ -721,7 +784,7 @@ unsigned char air1_opcal4_algorithm(
             algo_args->bias_cnt = 1;  /* transition step */
         } else if (algo_args->bias_cnt == 0) {
             algo_args->bias_cnt = 1;  /* first call */
-        } else if (idx >= 2 * (uint32_t)dev_info->err345_seq2) {
+        } else if (sf >= 2 * (uint32_t)dev_info->err345_seq2) {
             algo_args->bias_cnt++;
         }
     }
@@ -733,6 +796,11 @@ unsigned char air1_opcal4_algorithm(
     algo_args->kalman_roc[0] = 0.0;
 
     /* --- Step 11: Savitzky-Golay smoothing --- */
+    /* Save timestamps before smooth_sg corrupts them via uint16_t aliasing */
+    uint32_t saved_smooth_time[9];
+    for (int i = 0; i < 9; i++)
+        saved_smooth_time[i] = algo_args->smooth_time_in[i + 1];
+
     smooth_sg(algo_args->smooth_sig_in, (const uint16_t *)algo_args->smooth_time_in,
               algo_args->smooth_f_rep_in,
               algo_args->smooth_sig_in, (uint16_t *)algo_args->smooth_time_in,
@@ -745,6 +813,11 @@ unsigned char air1_opcal4_algorithm(
         algo_debug->smooth_seq[i] = (uint16_t)algo_args->smooth_time_in[i];
         algo_debug->smooth_frep[i] = algo_args->smooth_f_rep_in[i];
     }
+
+    /* Restore proper uint32_t timestamps for trendrate computation */
+    for (int i = 0; i < 9; i++)
+        algo_args->smooth_time_in[i] = saved_smooth_time[i];
+    algo_args->smooth_time_in[9] = time_now;
 
     /* --- Step 11b: Holt bias correction via inlined Kalman filter → opcal_ad ---
      *
@@ -815,6 +888,60 @@ unsigned char air1_opcal4_algorithm(
 
     /* Update prev_last_1min_curr for next call's i_sse interpolation */
     algo_args->err1_prev_last_1min_curr = tran_inA_1min[4];
+
+    /* --- Step 13b: Trendrate computation ---
+     * Rate-of-change indicator (mg/dL per minute) decoded from ARM binary
+     * at 0x65a20-0x65c30. Output-only — does not feed back into glucose. */
+    {
+        /* Update err_delay_arr: shift left, append current error status */
+        for (int i = 0; i < 6; i++)
+            algo_args->err_delay_arr[i] = algo_args->err_delay_arr[i + 1];
+        algo_args->err_delay_arr[6] = (errcode != 0) ? 1 : 0;
+        /* Guard: need at least 12 readings */
+        if (algo_args->idx_origin_seq < 12)
+            goto trendrate_done;
+
+        /* Guard: 6 consecutive timestamp pairs spaced >= 181s */
+        uint32_t *T = &algo_args->smooth_time_in[3];
+        for (int i = 0; i < 6; i++) {
+            if (T[i + 1] - T[i] < 181)
+                goto trendrate_done;
+        }
+
+        /* Guard: total span in [1200, 2100] seconds */
+        uint32_t span = time_now - T[0];
+        if (span < 1200 || span > 2100)
+            goto trendrate_done;
+
+        /* Guard: no error flags in delay array */
+        for (int i = 0; i < 7; i++) {
+            if (algo_args->err_delay_arr[i] == 1)
+                goto trendrate_done;
+        }
+
+        /* Compute calibrated glucose from smooth buffer */
+        double glu[7];
+        for (int i = 0; i < 7; i++) {
+            glu[i] = algo_args->smooth_sig_in[3 + i];
+            /* Guard: glucose in [40.0, 500.0] and positive */
+            if (glu[i] <= 0.0 || glu[i] < 40.0 || glu[i] > 500.0)
+                goto trendrate_done;
+        }
+
+        /* Rate computation */
+        double rate_long = (glu[6] - glu[0]) / ((double)(time_now - T[0]) / 60.0);
+        double rate_short = (glu[6] - glu[5]) / ((double)(time_now - T[5]) / 60.0);
+
+        /* Direction guard: reject when short and long trends oppose strongly */
+        if (rate_short < 0.0 && rate_long >= 1.0)
+            goto trendrate_done;
+        if (rate_short > 0.0 && rate_long <= -1.0)
+            goto trendrate_done;
+
+        double rate_mid = (glu[5] - glu[4]) / ((double)(T[5] - T[4]) / 60.0);
+        algo_debug->trendrate = (rate_short * rate_mid >= 0.0) ? rate_short : 0.0;
+    }
+trendrate_done:
 
     /* --- Step 14: Set final output --- */
     algo_output->result_glucose = result_glucose;

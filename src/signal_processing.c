@@ -52,26 +52,22 @@ void smooth_sg(const double *sig_in, const uint16_t *seq_in, const uint8_t *frep
        weights them, accumulates, then adds back sig_buf[9] * total_weight */
     double ref = sig_buf[9]; /* reference signal = last element */
 
-    /* Compute weighted differences for each output position */
-    double smoothed[10];
-    memset(smoothed, 0, sizeof(smoothed));
+    /* Positions 0-2: keep shifted buffer values (unsmoothed) */
+    for (int i = 0; i < 3; i++)
+        sig_out[i] = sig_buf[i];
 
+    /* Positions 3-9: SG weighted average using elements 0..6.
+     * smoothed = sum(w[k] * (sig_buf[idx] - ref)) for valid idx in [0,6].
+     * Normalize by total_weight to get weighted average. */
     for (int j = 3; j < 10; j++) {
         double acc = 0.0;
         for (int k = -3; k <= 3; k++) {
             int idx = j + k;
             if (idx >= 0 && idx <= 6) {
-                /* Difference from reference, weighted by kernel */
-                double diff = sig_buf[idx] - ref;
-                acc += weights[k + 3] * diff;
+                acc += weights[k + 3] * (sig_buf[idx] - ref);
             }
         }
-        smoothed[j] = acc;
-    }
-
-    /* Write output: smoothed[i] = accumulated_weighted_diff + ref * total_weight */
-    for (int i = 0; i < 10; i++) {
-        sig_out[i] = smoothed[i] + ref * total_weight;
+        sig_out[j] = acc / total_weight + ref;
     }
 
     /* Copy sequence and frep to output */
