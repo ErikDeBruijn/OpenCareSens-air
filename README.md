@@ -111,7 +111,7 @@ scripts/
 
 ## Acknowledgments
 
-This project builds on the pioneering work of the [Juggluco](https://github.com/j-kaltes/Juggluco) project by Jaap Kaltes, and the broader "We Will Not Wait" community that has made CGM data accessible to those who need it.
+This project builds on the pioneering work of the [Juggluco](https://github.com/j-kaltes/Juggluco) project by Jaap Korthals Altes, and the broader "We Will Not Wait" community that has made CGM data accessible to those who need it.
 
 ## License
 
