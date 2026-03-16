@@ -554,6 +554,10 @@ class OracleVerificationTest {
 
         int readingsCompared = 0;
         int glucoseMismatches = 0;
+        int errcodeMismatches = 0;
+        int calAvailableMismatches = 0;
+        int currentStageMismatches = 0;
+        int trendrateMismatches = 0;
 
         for (int seq = 1; seq <= READINGS_PER_LOT; seq++) {
             // --- Load oracle input ---
@@ -582,17 +586,25 @@ class OracleVerificationTest {
             CalibrationAlgorithm.process(devInfo, cgmInput, calInput,
                                           algoArgs, ourOutput, ourDebug);
 
-            // === Compare OUTPUT fields ===
+            // === Compare OUTPUT fields (safety-critical fields tracked separately) ===
             compareInt(oSeqOriginal, seq, ourOutput.seqNumberOriginal, oracleOutput.seqNumberOriginal);
             compareInt(oSeqFinal, seq, ourOutput.seqNumberFinal, oracleOutput.seqNumberFinal);
             compareInt(oMeasTime, seq, ourOutput.measurementTimeStandard, oracleOutput.measurementTimeStandard);
             if (!compareDouble(oResultGlucose, seq, ourOutput.resultGlucose, oracleOutput.resultGlucose)) {
                 glucoseMismatches++;
             }
-            compareDouble(oTrendrate, seq, ourOutput.trendrate, oracleOutput.trendrate);
-            compareInt(oCurrentStage, seq, ourOutput.currentStage, oracleOutput.currentStage);
-            compareInt(oErrcode, seq, ourOutput.errcode, oracleOutput.errcode);
-            compareInt(oCalAvailable, seq, ourOutput.calAvailableFlag, oracleOutput.calAvailableFlag);
+            if (!compareDouble(oTrendrate, seq, ourOutput.trendrate, oracleOutput.trendrate)) {
+                trendrateMismatches++;
+            }
+            if (!compareInt(oCurrentStage, seq, ourOutput.currentStage, oracleOutput.currentStage)) {
+                currentStageMismatches++;
+            }
+            if (!compareInt(oErrcode, seq, ourOutput.errcode, oracleOutput.errcode)) {
+                errcodeMismatches++;
+            }
+            if (!compareInt(oCalAvailable, seq, ourOutput.calAvailableFlag, oracleOutput.calAvailableFlag)) {
+                calAvailableMismatches++;
+            }
             compareInt(oDataType, seq, ourOutput.dataType, oracleOutput.dataType);
             for (int i = 0; i < 6; i++) {
                 compareDouble(oSmoothGlu[i], seq,
@@ -726,7 +738,10 @@ class OracleVerificationTest {
         printReport("OUTPUT", allOutputStats);
         printReport("DEBUG", allDebugStats);
 
-        return new LotResult(lotNum, readingsCompared, glucoseMismatches,
+        return new LotResult(lotNum, readingsCompared,
+            glucoseMismatches, errcodeMismatches,
+            calAvailableMismatches, currentStageMismatches,
+            trendrateMismatches,
             allOutputStats, allDebugStats);
     }
 
@@ -738,10 +753,15 @@ class OracleVerificationTest {
             "-----", "-----", "-----", "----", "-------", "-------", "---------");
 
         int totalMatch = 0, totalMismatch = 0, totalTotal = 0;
+        int fieldsCompared = 0;
+        int fieldsMatching = 0;
+        List<FieldStats> mismatchingFields = new ArrayList<>();
+
         for (FieldStats f : fields) {
             totalMatch += f.match;
             totalMismatch += f.mismatch;
             totalTotal += f.total;
+            fieldsCompared++;
 
             String absStr = (f.maxAbsErr > 0) ? String.format("%.1e", f.maxAbsErr) : "-";
             String relStr = (f.maxRelErr > 0) ? String.format("%.1e", f.maxRelErr) : "-";
@@ -749,19 +769,41 @@ class OracleVerificationTest {
                 ? "seq " + f.firstMismatchSeq : "-";
             String status = (f.mismatch == 0) ? " OK" : " FAIL";
 
+            if (f.mismatch == 0) {
+                fieldsMatching++;
+            } else {
+                mismatchingFields.add(f);
+            }
+
             System.out.printf("%-45s %6d %6d %6d %10s %10s %-12s%s%n",
                 f.name, f.total, f.match, f.mismatch,
                 absStr, relStr, firstStr, status);
         }
 
         double pct = (totalTotal > 0) ? 100.0 * totalMatch / totalTotal : 0.0;
-        System.out.printf("%n  TOTAL: %d/%d fields match (%.1f%%)%n", totalMatch, totalTotal, pct);
+        System.out.printf("%n  TOTAL: %d/%d field-readings match (%.1f%%)%n", totalMatch, totalTotal, pct);
+        System.out.printf("  FIELDS: %d/%d fields fully matching%n", fieldsMatching, fieldsCompared);
+
+        if (!mismatchingFields.isEmpty()) {
+            System.out.printf("%n  MISMATCHING FIELDS (%d):%n", mismatchingFields.size());
+            for (FieldStats f : mismatchingFields) {
+                System.out.printf("    %-45s %d/%d mismatches, first at seq %d%n",
+                    f.name, f.mismatch, f.total, f.firstMismatchSeq);
+                if (f.firstMismatchDetail != null) {
+                    System.out.printf("      -> %s%n", f.firstMismatchDetail);
+                }
+            }
+        }
     }
 
     static class LotResult {
         final int lotNum;
         final int readingsCompared;
         final int glucoseMismatches;
+        final int errcodeMismatches;
+        final int calAvailableMismatches;
+        final int currentStageMismatches;
+        final int trendrateMismatches;
         final List<FieldStats> outputStats;
         final List<FieldStats> debugStats;
         final int totalOutputMatch;
@@ -769,11 +811,18 @@ class OracleVerificationTest {
         final int totalDebugMatch;
         final int totalDebugMismatch;
 
-        LotResult(int lotNum, int readingsCompared, int glucoseMismatches,
+        LotResult(int lotNum, int readingsCompared,
+                  int glucoseMismatches, int errcodeMismatches,
+                  int calAvailableMismatches, int currentStageMismatches,
+                  int trendrateMismatches,
                   List<FieldStats> outputStats, List<FieldStats> debugStats) {
             this.lotNum = lotNum;
             this.readingsCompared = readingsCompared;
             this.glucoseMismatches = glucoseMismatches;
+            this.errcodeMismatches = errcodeMismatches;
+            this.calAvailableMismatches = calAvailableMismatches;
+            this.currentStageMismatches = currentStageMismatches;
+            this.trendrateMismatches = trendrateMismatches;
             this.outputStats = outputStats;
             this.debugStats = debugStats;
             int om = 0, omm = 0, dm = 0, dmm = 0;
@@ -790,7 +839,7 @@ class OracleVerificationTest {
     // Test methods — one per lot (parameterized)
     // ======================================================================
 
-    @ParameterizedTest(name = "lot{0}: eapp={0}")
+    @ParameterizedTest(name = "lot{0}")
     @ValueSource(ints = {0, 1, 2, 3, 4})
     @DisplayName("Oracle verification")
     void verifyLot(int lotNum) throws IOException {
@@ -799,38 +848,42 @@ class OracleVerificationTest {
 
         LotResult result = runLotVerification(lotNum);
 
-        // Print first N mismatches for diagnosis
-        List<FieldStats> allStats = new ArrayList<>();
-        allStats.addAll(result.outputStats);
-        allStats.addAll(result.debugStats);
+        // --- Summary of safety-critical fields ---
+        System.out.printf("%n=== Lot %d Safety-Critical Summary ===%n", lotNum);
+        System.out.printf("  Readings compared:      %d%n", result.readingsCompared);
+        System.out.printf("  Glucose mismatches:     %d%n", result.glucoseMismatches);
+        System.out.printf("  Errcode mismatches:     %d%n", result.errcodeMismatches);
+        System.out.printf("  CalAvailable mismatches:%d%n", result.calAvailableMismatches);
+        System.out.printf("  CurrentStage mismatches:%d%n", result.currentStageMismatches);
+        System.out.printf("  Trendrate mismatches:   %d%n", result.trendrateMismatches);
+        System.out.printf("  Output fields:          %d/%d match%n",
+            result.totalOutputMatch, result.totalOutputMatch + result.totalOutputMismatch);
+        System.out.printf("  Debug fields:           %d/%d match%n",
+            result.totalDebugMatch, result.totalDebugMatch + result.totalDebugMismatch);
 
-        int mismatchFieldCount = 0;
-        System.out.println("\n--- First mismatches for lot" + lotNum + " ---");
-        for (FieldStats f : allStats) {
-            if (f.mismatch > 0) {
-                mismatchFieldCount++;
-                if (mismatchFieldCount <= 20) {
-                    System.out.printf("  %-45s: %d/%d mismatches, first at seq %d: %s%n",
-                        f.name, f.mismatch, f.total, f.firstMismatchSeq,
-                        f.firstMismatchDetail != null ? f.firstMismatchDetail : "");
-                }
-            }
-        }
-        if (mismatchFieldCount > 20) {
-            System.out.printf("  ... and %d more mismatching fields%n", mismatchFieldCount - 20);
-        }
-
-        System.out.printf("%nLot %d summary: output %d/%d match, debug %d/%d match, glucose mismatches: %d%n",
-            lotNum,
-            result.totalOutputMatch, result.totalOutputMatch + result.totalOutputMismatch,
-            result.totalDebugMatch, result.totalDebugMatch + result.totalDebugMismatch,
-            result.glucoseMismatches);
-
-        // CRITICAL ASSERTION: glucose values must match
+        // CRITICAL ASSERTIONS: safety-critical output fields must match the oracle
         assertEquals(0, result.glucoseMismatches,
-            "MEDICAL SAFETY FAILURE: " + result.glucoseMismatches
+            "PATIENT SAFETY: " + result.glucoseMismatches
             + " glucose value mismatches in lot" + lotNum
-            + ". Every glucose reading must match the oracle at 1e-10 precision.");
+            + ". Every glucose reading must match the oracle.");
+
+        assertEquals(0, result.errcodeMismatches,
+            "PATIENT SAFETY: " + result.errcodeMismatches
+            + " errcode mismatches in lot" + lotNum
+            + ". Errcode determines whether a reading is shown to the patient.");
+
+        assertEquals(0, result.calAvailableMismatches,
+            "PATIENT SAFETY: " + result.calAvailableMismatches
+            + " cal_available_flag mismatches in lot" + lotNum);
+
+        assertEquals(0, result.currentStageMismatches,
+            "PATIENT SAFETY: " + result.currentStageMismatches
+            + " current_stage mismatches in lot" + lotNum);
+
+        assertEquals(0, result.trendrateMismatches,
+            "PATIENT SAFETY: " + result.trendrateMismatches
+            + " trendrate mismatches in lot" + lotNum
+            + ". Trend arrows guide insulin dosing decisions.");
     }
 
     // ======================================================================
@@ -845,6 +898,10 @@ class OracleVerificationTest {
 
         int totalReadings = 0;
         int totalGluMismatches = 0;
+        int totalErrcodeMismatches = 0;
+        int totalCalAvailMismatches = 0;
+        int totalStageMismatches = 0;
+        int totalTrendrateMismatches = 0;
         int totalOutputMatch = 0, totalOutputMismatch = 0;
         int totalDebugMatch = 0, totalDebugMismatch = 0;
 
@@ -858,6 +915,10 @@ class OracleVerificationTest {
             LotResult result = runLotVerification(lot);
             totalReadings += result.readingsCompared;
             totalGluMismatches += result.glucoseMismatches;
+            totalErrcodeMismatches += result.errcodeMismatches;
+            totalCalAvailMismatches += result.calAvailableMismatches;
+            totalStageMismatches += result.currentStageMismatches;
+            totalTrendrateMismatches += result.trendrateMismatches;
             totalOutputMatch += result.totalOutputMatch;
             totalOutputMismatch += result.totalOutputMismatch;
             totalDebugMatch += result.totalDebugMatch;
@@ -868,6 +929,11 @@ class OracleVerificationTest {
         System.out.println("FULL ORACLE VERIFICATION SUMMARY");
         System.out.println("========================================");
         System.out.printf("Total readings:          %d%n", totalReadings);
+        System.out.printf("Glucose mismatches:      %d%n", totalGluMismatches);
+        System.out.printf("Errcode mismatches:      %d%n", totalErrcodeMismatches);
+        System.out.printf("CalAvailable mismatches: %d%n", totalCalAvailMismatches);
+        System.out.printf("CurrentStage mismatches: %d%n", totalStageMismatches);
+        System.out.printf("Trendrate mismatches:    %d%n", totalTrendrateMismatches);
         System.out.printf("Output fields match:     %d/%d (%.1f%%)%n",
             totalOutputMatch, totalOutputMatch + totalOutputMismatch,
             (totalOutputMatch + totalOutputMismatch > 0)
@@ -876,11 +942,22 @@ class OracleVerificationTest {
             totalDebugMatch, totalDebugMatch + totalDebugMismatch,
             (totalDebugMatch + totalDebugMismatch > 0)
                 ? 100.0 * totalDebugMatch / (totalDebugMatch + totalDebugMismatch) : 0.0);
-        System.out.printf("Glucose mismatches:      %d%n", totalGluMismatches);
         System.out.println("========================================");
 
         assertEquals(0, totalGluMismatches,
-            "MEDICAL SAFETY FAILURE: " + totalGluMismatches
+            "PATIENT SAFETY: " + totalGluMismatches
             + " total glucose value mismatches across all lots.");
+        assertEquals(0, totalErrcodeMismatches,
+            "PATIENT SAFETY: " + totalErrcodeMismatches
+            + " total errcode mismatches across all lots.");
+        assertEquals(0, totalCalAvailMismatches,
+            "PATIENT SAFETY: " + totalCalAvailMismatches
+            + " total cal_available_flag mismatches across all lots.");
+        assertEquals(0, totalStageMismatches,
+            "PATIENT SAFETY: " + totalStageMismatches
+            + " total current_stage mismatches across all lots.");
+        assertEquals(0, totalTrendrateMismatches,
+            "PATIENT SAFETY: " + totalTrendrateMismatches
+            + " total trendrate mismatches across all lots.");
     }
 }
