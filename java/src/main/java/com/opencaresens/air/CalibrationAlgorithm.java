@@ -178,9 +178,11 @@ public final class CalibrationAlgorithm {
         }
         tMean /= (double) bufLen;
 
-        if (lotType == 2) {
-            return 1.0 + LOT2_TEMP_COEFF * (tMean - LOT2_TEMP_REF);
-        } else if (lotType == 1) {
+        // Oracle-verified: the proprietary binary uses the same temperature correction
+        // formula for ALL lot types (lot_type 1 formula), not a lot_type-specific one.
+        // Verified: lot0 (eapp=0.10067) and lot2 (eapp=0.05) both produce
+        // srt = 1 + (-0.1584) * (T_mean - 37.0) = 1.0792 at T=36.5.
+        if (lotType == 1 || lotType == 2) {
             return 1.0 + (-TEMP_COEFF) * (tMean - TEMP_REF);
         } else {
             return 1.0; // lot_type 0: no correction
@@ -233,8 +235,23 @@ public final class CalibrationAlgorithm {
         algoDebug.seqNumberFinal = seqFinal;
         algoDebug.measurementTimeStandard = timeNow;
         algoDebug.dataType = 0;
-        algoDebug.temperature = cgmInput.temperature;
+        // Note: temperature is set AFTER the eapp check below (oracle-verified:
+        // the binary returns before setting temperature when eapp is invalid)
         System.arraycopy(cgmInput.workout, 0, algoDebug.workout, 0, 30);
+
+        // --- Parameter validation: eapp range check ---
+        // Oracle-verified: the proprietary binary rejects eapp values outside the
+        // sensor's valid operating range. eapp >= 0.12 produces errcode=64 (bit 6)
+        // with zeroed output. The debug struct retains header fields (seq, time,
+        // workout) but temperature stays zeroed.
+        double dEappCheck = (double) devInfo.eapp;
+        if (dEappCheck >= 0.12) {
+            algoOutput.errcode = 64;
+            algoOutput.resultGlucose = 0.0;
+            return 1;
+        }
+
+        algoDebug.temperature = cgmInput.temperature;
 
         // --- Debug initialization (oracle-verified) ---
         algoDebug.stateReturnOpcal = algoArgs.stateReturnOpcal;
@@ -332,26 +349,11 @@ public final class CalibrationAlgorithm {
         algoDebug.slopeRatioTemp = slopeRatioTemp;
 
         // --- Step 7: Drift correction and baseline extraction ---
-        double outDrift;
-        if (algoArgs.lotType == 1) {
-            outDrift = driftCorrection(outIir, algoArgs, algoDebug);
-        } else {
-            // Skip polynomial drift but still extract baseline
-            int n = algoArgs.idxOriginSeq;
-            outDrift = outIir;
-            algoDebug.outDrift = outDrift;
-            if (n == 1) {
-                algoArgs.baselinePrev = outDrift;
-                algoDebug.currBaseline = outDrift;
-                algoDebug.initstableDiffDc = outDrift;
-            } else {
-                double prevBaseline = algoArgs.baselinePrev;
-                double newBaseline = (prevBaseline * (double) (n - 1) + outDrift) / (double) n;
-                algoDebug.currBaseline = newBaseline;
-                algoDebug.initstableDiffDc = newBaseline - prevBaseline;
-                algoArgs.baselinePrev = newBaseline;
-            }
-        }
+        // Oracle-verified: drift correction is applied for ALL lot types (lot_type 1 and 2).
+        // The proprietary binary uses the same cubic polynomial drift + baseline extraction
+        // regardless of eapp/lot_type. Verified: lot2 (eapp=0.05) oracle shows
+        // out_drift = out_iir / divisor, not out_drift = out_iir.
+        double outDrift = driftCorrection(outIir, algoArgs, algoDebug);
 
         // --- Step 7b: Initstable counter ---
         {
@@ -463,10 +465,14 @@ public final class CalibrationAlgorithm {
         }
         System.arraycopy(sgResult.frepOut, 0, algoArgs.smoothFRepIn, 0, 6);
 
+        // Oracle-verified: smooth_result_glucose corresponds to SG buffer positions [3..8],
+        // NOT [0..5]. The SG buffer has 10 elements: positions [0..2] are unsmoothed
+        // (shifted raw values), [3..9] are SG-convolved. The 6 output smooth values
+        // come from positions [3..8]. Similarly for smooth_seq.
         for (int i = 0; i < 6; i++) {
-            algoDebug.smoothSig[i] = algoArgs.smoothSigIn[i];
-            algoDebug.smoothSeq[i] = (int) algoArgs.smoothTimeIn[i];
-            algoDebug.smoothFrep[i] = algoArgs.smoothFRepIn[i];
+            algoDebug.smoothSig[i] = algoArgs.smoothSigIn[i + 3];
+            algoDebug.smoothSeq[i] = (int) algoArgs.smoothTimeIn[i + 3];
+            algoDebug.smoothFrep[i] = (i < algoArgs.smoothFRepIn.length) ? algoArgs.smoothFRepIn[i] : 0;
         }
 
         // Restore proper timestamps for trendrate

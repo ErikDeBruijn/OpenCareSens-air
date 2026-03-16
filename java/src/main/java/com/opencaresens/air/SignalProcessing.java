@@ -66,16 +66,33 @@ public final class SignalProcessing {
             sigOut[i] = sigBuf[i];
         }
 
-        // Positions 3-9: weighted average
-        for (int j = 3; j < 10; j++) {
-            double acc = 0.0;
-            for (int k = -3; k <= 3; k++) {
-                int idx = j + k;
-                if (idx >= 0 && idx <= 6) {
-                    acc += weights[k + 3] * (sigBuf[idx] - ref);
-                }
+        // Oracle-verified: the SG convolution only applies when ALL values in
+        // the core window [0..6] are non-zero (i.e., have valid data).
+        // When the buffer is still filling up (zeros present), the raw shifted
+        // values pass through unchanged. This prevents convolution artifacts
+        // from zero-padded windows that would cascade into wrong values.
+        boolean windowValid = true;
+        for (int i = 0; i <= 6; i++) {
+            if (sigBuf[i] == 0.0) {
+                windowValid = false;
+                break;
             }
-            sigOut[j] = acc / totalWeight + ref;
+        }
+
+        // Positions 3-9: SG weighted average (when valid) or pass-through
+        for (int j = 3; j < 10; j++) {
+            if (!windowValid) {
+                sigOut[j] = sigBuf[j];
+            } else {
+                double acc = 0.0;
+                for (int k = -3; k <= 3; k++) {
+                    int idx = j + k;
+                    if (idx >= 0 && idx <= 6) {
+                        acc += weights[k + 3] * (sigBuf[idx] - ref);
+                    }
+                }
+                sigOut[j] = acc / totalWeight + ref;
+            }
         }
 
         return new SgResult(sigOut, seqBuf, frepBuf);

@@ -206,11 +206,14 @@ class CalibrationAlgorithmTest {
         }
 
         @Test
-        @DisplayName("lot2: temp=34.0854 (reference) => srt=1.0")
+        @DisplayName("lot2: uses lot1 formula (oracle-verified: same temp correction for all lots)")
         void lot2TempRef() {
             AlgorithmState args = new AlgorithmState();
             args.idxOriginSeq = 1;
-            double srt = CalibrationAlgorithm.computeSlopeRatioTempBuffered(34.0854, args, 2);
+            // Oracle-verified: lot_type=2 uses the same formula as lot_type=1:
+            // srt = 1 + (-0.1584) * (T - 37.0)
+            // At T=37.0: srt = 1.0
+            double srt = CalibrationAlgorithm.computeSlopeRatioTempBuffered(37.0, args, 2);
             assertEquals(1.0, srt, 1e-8);
         }
 
