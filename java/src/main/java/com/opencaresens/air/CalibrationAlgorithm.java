@@ -465,14 +465,14 @@ public final class CalibrationAlgorithm {
         }
         System.arraycopy(sgResult.frepOut, 0, algoArgs.smoothFRepIn, 0, 6);
 
-        // Oracle-verified: smooth_result_glucose corresponds to SG buffer positions [3..8],
-        // NOT [0..5]. The SG buffer has 10 elements: positions [0..2] are unsmoothed
+        // Oracle-verified: smooth_result_glucose corresponds to SG buffer positions [3..8].
+        // The SG buffer has 10 elements: positions [0..2] are unsmoothed
         // (shifted raw values), [3..9] are SG-convolved. The 6 output smooth values
         // come from positions [3..8]. Similarly for smooth_seq.
         for (int i = 0; i < 6; i++) {
             algoDebug.smoothSig[i] = algoArgs.smoothSigIn[i + 3];
             algoDebug.smoothSeq[i] = (int) algoArgs.smoothTimeIn[i + 3];
-            algoDebug.smoothFrep[i] = (i < algoArgs.smoothFRepIn.length) ? algoArgs.smoothFRepIn[i] : 0;
+            algoDebug.smoothFrep[i] = algoArgs.smoothFRepIn[i];
         }
 
         // Restore proper timestamps for trendrate

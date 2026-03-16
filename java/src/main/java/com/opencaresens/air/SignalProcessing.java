@@ -57,20 +57,37 @@ public final class SignalProcessing {
         }
         frepBuf[5] = newFrep;
 
-        // SG convolution
+        // SG convolution per ARM disassembly (smooth_sg @ 0x6ccbc):
+        //
+        // The binary computes a CONVOLUTION of the normalized signal differences
+        // with a kernel derived from the wSgX100 weights. The convolution index
+        // range is j=3..12, with active terms bounded by 0 <= (j-m) <= 6.
+        //
+        // Phase 1: Compute kernel sp[i] = weights[i] (already divided by 100)
+        //          In the binary, sp[i] = fixed_table[i] * args_table[i],
+        //          but since the fixed_table is unknown, we use weights directly.
+        //
+        // Phase 2: Normalize differences: diff[i] = (sigBuf[i] - ref) / totalWeight
+        // Phase 3: Convolve: result[j-3] = sum(diff[m] * sp[j-m]) for 0<=j-m<=6
+        // Phase 4: Restore: sigOut[j-3] = ref + result[j-3] * totalWeight
+        //          (totalWeight cancels out, so sigOut[j-3] = ref + sum((sigBuf[m]-ref)*sp[j-m]))
+        //
+        // NOTE: This convolution formula was verified against the ARM disassembly
+        // but the effective kernel (sp[]) in the binary is a product of a fixed
+        // coefficient table and a state-dependent table from the arguments struct.
+        // The current implementation uses weights[i] directly, which does NOT match
+        // the oracle output for smooth_result_glucose. The kernel derivation from
+        // the binary's fixed and dynamic tables needs further reverse engineering.
+        // This does NOT affect result_glucose (which matches 100%).
         double ref = sigBuf[9];
         double[] sigOut = new double[10];
 
-        // Positions 0-2: unsmoothed
+        // Positions 0-2: unsmoothed (shifted raw values)
         for (int i = 0; i < 3; i++) {
             sigOut[i] = sigBuf[i];
         }
 
-        // Oracle-verified: the SG convolution only applies when ALL values in
-        // the core window [0..6] are non-zero (i.e., have valid data).
-        // When the buffer is still filling up (zeros present), the raw shifted
-        // values pass through unchanged. This prevents convolution artifacts
-        // from zero-padded windows that would cascade into wrong values.
+        // Skip convolution when buffer is still filling (zeros present)
         boolean windowValid = true;
         for (int i = 0; i <= 6; i++) {
             if (sigBuf[i] == 0.0) {
@@ -79,7 +96,7 @@ public final class SignalProcessing {
             }
         }
 
-        // Positions 3-9: SG weighted average (when valid) or pass-through
+        // Positions 3-9: SG convolution (when valid) or pass-through
         for (int j = 3; j < 10; j++) {
             if (!windowValid) {
                 sigOut[j] = sigBuf[j];
