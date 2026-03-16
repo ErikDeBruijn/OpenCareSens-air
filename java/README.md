@@ -2,7 +2,7 @@
 
 Pure Java port of the CareSens Air CGM calibration algorithm. Converts raw ADC sensor readings into calibrated glucose values (mg/dL) with trend rate computation. No Android dependencies -- works anywhere Java runs.
 
-**Verification:** 2000+ oracle readings tested across 5 sensor lots (normal, hypo, hyper profiles). 100% glucose match against the proprietary i-SENS library (bit-exact integers, machine-epsilon floats).
+**Verification:** 2000 oracle readings tested across 5 sensor lots (normal, extreme, low-eapp, hypo, hyper profiles). All safety-critical outputs (glucose, error codes, stage, trend rate) match 100% against the proprietary i-SENS library. Debug intermediates match 99.995% (263987/264000 fields).
 
 **Medical context:** This library produces glucose values that people with diabetes use to dose insulin. Incorrect values can be dangerous. Do not modify the calibration pipeline without re-running full oracle verification.
 
@@ -95,44 +95,26 @@ The `SensorConfig` must match the sensor that produced the saved state. Mixing c
 
 ## Building
 
-Requires JDK 11+. No other dependencies (JUnit 5 for tests only).
+Requires JDK 11+. No other dependencies (JUnit 5 is downloaded automatically for tests).
 
 ```bash
-# With Gradle wrapper
 cd java
-./gradlew build
-
-# Without Gradle -- compile directly
-javac -d build/classes src/main/java/com/opencaresens/air/**/*.java
+./build.sh          # compile + run all tests
+./build.sh compile  # compile only
+./build.sh test     # run tests only
 ```
 
-Run tests:
-```bash
-./gradlew test
-```
+The build script auto-detects your JDK and downloads the JUnit 5 standalone runner.
 
 ## Android integration
 
 The library is a pure Java JAR with zero Android dependencies.
 
-### Option 1: Gradle module
+### Option 1: Source inclusion
 
-Copy the `java/` directory into your project and add to `settings.gradle`:
+Copy `java/src/main/java/com/opencaresens/air/` into your Android project's `java/` source directory. No build configuration needed -- it's all standard Java with zero dependencies.
 
-```groovy
-include ':opencaresens-air'
-project(':opencaresens-air').projectDir = new File('opencaresens-air')
-```
-
-Then in your app's `build.gradle`:
-
-```groovy
-dependencies {
-    implementation project(':opencaresens-air')
-}
-```
-
-### Option 2: JitPack
+### Option 2: JitPack (once a release is tagged)
 
 ```groovy
 repositories {
