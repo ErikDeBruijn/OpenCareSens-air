@@ -4,7 +4,8 @@ package com.opencaresens.air.model;
  * Calibration log entry — one per BG calibration event (104 bytes in C).
  * Maps to air1_opcal4_cal_log_t.
  */
-public class CalibrationLog {
+public class CalibrationLog implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
     public int group;
     public long bgTime;
     public double bgSeq;

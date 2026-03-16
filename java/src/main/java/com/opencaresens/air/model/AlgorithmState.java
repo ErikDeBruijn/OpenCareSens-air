@@ -4,7 +4,8 @@ package com.opencaresens.air.model;
  * Persistent algorithm state — massive struct holding all inter-reading state (117312 bytes in C).
  * Maps to air1_opcal4_arguments_t.
  */
-public class AlgorithmState {
+public class AlgorithmState implements java.io.Serializable {
+    private static final long serialVersionUID = 1L;
     public int argsSeq;
     public int lotType;
     public long sensorStartTime;
