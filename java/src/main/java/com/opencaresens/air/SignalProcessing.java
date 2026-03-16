@@ -4,7 +4,7 @@ package com.opencaresens.air;
  * Signal processing functions ported from C (signal_processing.c).
  * All methods are static. Behavior matches the C implementation exactly.
  */
-public final class SignalProcessing {
+final class SignalProcessing {
 
     private SignalProcessing() {} // prevent instantiation
 
@@ -45,16 +45,12 @@ public final class SignalProcessing {
         double[] sigBuf = new double[10];
         int[] seqBuf = new int[10];
         int[] frepBuf = new int[6];
-        for (int i = 0; i < 9; i++) {
-            sigBuf[i] = sigIn[i + 1];
-            seqBuf[i] = seqIn[i + 1];
-        }
+        System.arraycopy(sigIn, 1, sigBuf, 0, 9);
+        System.arraycopy(seqIn, 1, seqBuf, 0, 9);
         sigBuf[9] = newSig;
         seqBuf[9] = newSeq;
 
-        for (int i = 0; i < 5; i++) {
-            frepBuf[i] = frepIn[i + 1];
-        }
+        System.arraycopy(frepIn, 1, frepBuf, 0, 5);
         frepBuf[5] = newFrep;
 
         // SG convolution per ARM disassembly (smooth_sg @ 0x6ccbc):
@@ -235,9 +231,7 @@ public final class SignalProcessing {
         double lowerBound = diagIntercept - cornerOffset + diagSlope * ycept;
         double upperBound = cornerOffset + diagIntercept + diagSlope * ycept;
 
-        if (slope < lowerBound || slope > upperBound) return false;
-
-        return true;
+        return slope >= lowerBound && slope <= upperBound;
     }
 
     // ------------------------------------------------------------------

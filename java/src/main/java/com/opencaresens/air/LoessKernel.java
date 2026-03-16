@@ -6,7 +6,7 @@ package com.opencaresens.air;
  * in signal processing. The table exploits symmetry: for evaluation point
  * e < 45, weight = TABLE[d][e]; for e >= 45, weight = TABLE[89-d][89-e].
  */
-public final class LoessKernel {
+final class LoessKernel {
 
     private LoessKernel() { }
 

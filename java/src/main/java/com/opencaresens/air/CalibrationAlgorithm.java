@@ -7,6 +7,8 @@ import com.opencaresens.air.model.CgmInput;
 import com.opencaresens.air.model.DebugOutput;
 import com.opencaresens.air.model.DeviceInfo;
 
+import java.util.Arrays;
+
 /**
  * Main 14-step calibration pipeline for the CareSens Air CGM.
  * Ported from air1_opcal4_algorithm() in calibration.c.
@@ -15,7 +17,7 @@ import com.opencaresens.air.model.DeviceInfo;
  * the C implementation at machine-epsilon precision. Incorrect glucose values
  * lead to wrong insulin dosing, causing dangerous hypo/hyperglycemia.
  */
-public final class CalibrationAlgorithm {
+final class CalibrationAlgorithm {
 
     private CalibrationAlgorithm() {} // prevent instantiation
 
@@ -432,18 +434,14 @@ public final class CalibrationAlgorithm {
         }
         algoDebug.stateInitKalman = algoArgs.biasFlag;
 
-        // Store rate of change history
-        for (int i = 3; i > 0; i--) {
-            algoArgs.kalmanRoc[i] = algoArgs.kalmanRoc[i - 1];
-        }
+        // Store rate of change history (shift right by 1)
+        System.arraycopy(algoArgs.kalmanRoc, 0, algoArgs.kalmanRoc, 1, 3);
         algoArgs.kalmanRoc[0] = 0.0;
 
         // --- Step 11: Savitzky-Golay smoothing ---
         // Save timestamps before smooth_sg corrupts via int aliasing
         long[] savedSmoothTime = new long[9];
-        for (int i = 0; i < 9; i++) {
-            savedSmoothTime[i] = algoArgs.smoothTimeIn[i + 1];
-        }
+        System.arraycopy(algoArgs.smoothTimeIn, 1, savedSmoothTime, 0, 9);
 
         // Convert long[] to int[] for SG
         int[] seqInSg = new int[10];
@@ -476,9 +474,7 @@ public final class CalibrationAlgorithm {
         }
 
         // Restore proper timestamps for trendrate
-        for (int i = 0; i < 9; i++) {
-            algoArgs.smoothTimeIn[i] = savedSmoothTime[i];
-        }
+        System.arraycopy(savedSmoothTime, 0, algoArgs.smoothTimeIn, 0, 9);
         algoArgs.smoothTimeIn[9] = timeNow;
 
         // --- Step 11b: Holt bias correction ---
@@ -562,9 +558,7 @@ public final class CalibrationAlgorithm {
     static void computeTrendrate(AlgorithmState algoArgs, DebugOutput algoDebug,
                                   int errcode, long timeNow) {
         // Update err_delay_arr: shift left, append current error status
-        for (int i = 0; i < 6; i++) {
-            algoArgs.errDelayArr[i] = algoArgs.errDelayArr[i + 1];
-        }
+        System.arraycopy(algoArgs.errDelayArr, 1, algoArgs.errDelayArr, 0, 6);
         algoArgs.errDelayArr[6] = (errcode != 0) ? 1 : 0;
 
         // Guard: need at least 12 readings
@@ -614,13 +608,13 @@ public final class CalibrationAlgorithm {
         out.seqNumberOriginal = 0;
         out.seqNumberFinal = 0;
         out.measurementTimeStandard = 0;
-        java.util.Arrays.fill(out.workout, 0);
+        Arrays.fill(out.workout, 0);
         out.resultGlucose = 0.0;
         out.trendrate = 0.0;
         out.currentStage = 0;
-        java.util.Arrays.fill(out.smoothFixedFlag, 0);
-        java.util.Arrays.fill(out.smoothSeq, 0);
-        java.util.Arrays.fill(out.smoothResultGlucose, 0.0);
+        Arrays.fill(out.smoothFixedFlag, 0);
+        Arrays.fill(out.smoothSeq, 0);
+        Arrays.fill(out.smoothResultGlucose, 0.0);
         out.errcode = 0;
         out.calAvailableFlag = 0;
         out.dataType = 0;
@@ -633,9 +627,9 @@ public final class CalibrationAlgorithm {
         d.dataType = 0;
         d.stage = 0;
         d.temperature = 0.0;
-        java.util.Arrays.fill(d.workout, 0);
-        java.util.Arrays.fill(d.tranInA, 0.0);
-        java.util.Arrays.fill(d.tranInA1min, 0.0);
+        Arrays.fill(d.workout, 0);
+        Arrays.fill(d.tranInA, 0.0);
+        Arrays.fill(d.tranInA1min, 0.0);
         d.tranInA5min = 0.0;
         d.ycept = 0.0;
         d.correctedReCurrent = 0.0;
@@ -656,9 +650,9 @@ public final class CalibrationAlgorithm {
         d.outRescale = 0.0;
         d.opcalAd = 0.0;
         d.stateInitKalman = 0;
-        java.util.Arrays.fill(d.smoothSeq, 0);
-        java.util.Arrays.fill(d.smoothSig, 0.0);
-        java.util.Arrays.fill(d.smoothFrep, 0);
+        Arrays.fill(d.smoothSeq, 0);
+        Arrays.fill(d.smoothSig, 0.0);
+        Arrays.fill(d.smoothFrep, 0);
         d.calState = 0;
         d.stateReturnOpcal = 0;
         d.validBgTime = 0;
@@ -677,16 +671,16 @@ public final class CalibrationAlgorithm {
         d.callogCslopeNew = 0.0;
         d.callogCyceptNew = 0.0;
         d.callogInlierFlg = 0;
-        java.util.Arrays.fill(d.calSlope, 0.0);
-        java.util.Arrays.fill(d.calYcept, 0.0);
-        java.util.Arrays.fill(d.calInput, 0.0);
-        java.util.Arrays.fill(d.calOutput, 0.0);
+        Arrays.fill(d.calSlope, 0.0);
+        Arrays.fill(d.calYcept, 0.0);
+        Arrays.fill(d.calInput, 0.0);
+        Arrays.fill(d.calOutput, 0.0);
         d.initstableWeightUsercal = 0.0;
         d.initstableWeightNocal = 0.0;
         d.initstableFixusercal = 0.0;
         d.nOpcalState = 0;
         d.initstableInitEndPoint = 0;
-        java.util.Arrays.fill(d.outWeightSd, 0.0);
+        Arrays.fill(d.outWeightSd, 0.0);
         d.outWeightAd = 0.0;
         d.shiftoutAd = 0.0;
         d.errorCode1 = 0;
@@ -723,11 +717,11 @@ public final class CalibrationAlgorithm {
         d.err1LengthT9Trio = 0;
         d.err1LengthT10Trio = 0;
         d.err1ResultTD = 0;
-        java.util.Arrays.fill(d.err1ResultConditionTD, 0);
+        Arrays.fill(d.err1ResultConditionTD, 0);
         d.err1TDCount = 0;
         d.err1TDTemporaryBreakFlag = 0;
-        java.util.Arrays.fill(d.err1TDTimeTrio, 0);
-        java.util.Arrays.fill(d.err1TDValueTrio, 0.0);
+        Arrays.fill(d.err1TDTimeTrio, 0);
+        Arrays.fill(d.err1TDValueTrio, 0.0);
         d.err2DelayRevisedValue = 0.0;
         d.err2DelayRoc = 0.0;
         d.err2DelaySlopeSharp = 0.0;
@@ -737,21 +731,21 @@ public final class CalibrationAlgorithm {
         d.err2DelaySlopeTrimmedMean = 0.0;
         d.err2DelayGluCummax = 0.0;
         d.err2DelayGluTrimmedMean = 0.0;
-        java.util.Arrays.fill(d.err2DelayPreCondi, 0);
-        java.util.Arrays.fill(d.err2DelayCondi, 0);
+        Arrays.fill(d.err2DelayPreCondi, 0);
+        Arrays.fill(d.err2DelayCondi, 0);
         d.err2DelayFlag = 0;
         d.err2Cummax = 0.0;
-        java.util.Arrays.fill(d.err2CrtCurrent, 0);
-        java.util.Arrays.fill(d.err2CrtGlu, 0);
+        Arrays.fill(d.err2CrtCurrent, 0);
+        Arrays.fill(d.err2CrtGlu, 0);
         d.err2CrtCv = 0.0;
-        java.util.Arrays.fill(d.err2Condi, 0);
+        Arrays.fill(d.err2Condi, 0);
         d.err4Min = 0.0;
         d.err4Range = 0.0;
         d.err4MinDiff = 0.0;
-        java.util.Arrays.fill(d.err4Condi, 0);
-        java.util.Arrays.fill(d.err4DelayCondi, 0);
+        Arrays.fill(d.err4Condi, 0);
+        Arrays.fill(d.err4DelayCondi, 0);
         d.err4DelayFlag = 0;
-        java.util.Arrays.fill(d.err8Condi, 0);
+        Arrays.fill(d.err8Condi, 0);
         d.err16CalConsDUsercalAfter = 0.0;
         d.err16CalDayDTemp = 0.0;
         d.err16CalDayDRef = 0.0;
@@ -790,7 +784,7 @@ public final class CalibrationAlgorithm {
         d.err16CgmIsfTrendMeanMaxTempEarly = 0.0;
         d.err16CgmIsfTrendMeanMaxEarly = 0.0;
         d.err16CgmIsfTrendMeanRatioEarly = 0.0;
-        java.util.Arrays.fill(d.err16Condi, 0);
+        Arrays.fill(d.err16Condi, 0);
         d.err128Flag = 0;
         d.err128RevisedValue = 0.0;
         d.err128Normal = 0.0;

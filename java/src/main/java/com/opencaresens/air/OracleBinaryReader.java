@@ -5,7 +5,7 @@ import com.opencaresens.air.model.*;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.nio.charset.StandardCharsets;
+
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -21,7 +21,7 @@ import java.nio.file.Paths;
  *
  * All files are little-endian (ARM).
  */
-public class OracleBinaryReader {
+class OracleBinaryReader {
 
     public static final int OUTPUT_SIZE = 155;
     public static final int DEBUG_SIZE = 1579;

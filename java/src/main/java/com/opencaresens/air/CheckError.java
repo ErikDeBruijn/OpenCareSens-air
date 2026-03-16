@@ -4,6 +4,8 @@ import com.opencaresens.air.model.AlgorithmState;
 import com.opencaresens.air.model.DebugOutput;
 import com.opencaresens.air.model.DeviceInfo;
 
+import java.util.Arrays;
+
 /**
  * Master error detection for CGM readings (8008 ARM instructions in binary).
  *
@@ -19,7 +21,7 @@ import com.opencaresens.air.model.DeviceInfo;
  * Ported from check_error.c — every conditional, threshold, and array operation
  * must match the C implementation exactly. This is medical safety-critical code.
  */
-public final class CheckError {
+final class CheckError {
 
     private CheckError() {} // prevent instantiation
 
@@ -290,9 +292,7 @@ public final class CheckError {
 
         // Always accumulate round(glucose) into sliding window
         double roundGlu = Math.round(currentGlucose);
-        for (int i = 0; i < 5; i++) {
-            algoArgs.err2CummaxForetime[i] = algoArgs.err2CummaxForetime[i + 1];
-        }
+        System.arraycopy(algoArgs.err2CummaxForetime, 1, algoArgs.err2CummaxForetime, 0, 5);
         algoArgs.err2CummaxForetime[5] = roundGlu;
 
         if (seq < err2Threshold) {
@@ -430,8 +430,8 @@ public final class CheckError {
             }
 
             // Delay pre_condi and condi: inactive
-            java.util.Arrays.fill(debug.err2DelayPreCondi, 0);
-            java.util.Arrays.fill(debug.err2DelayCondi, 0);
+            Arrays.fill(debug.err2DelayPreCondi, 0);
+            Arrays.fill(debug.err2DelayCondi, 0);
             debug.err2DelayFlag = 0;
         }
 

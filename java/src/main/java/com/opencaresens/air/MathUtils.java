@@ -6,7 +6,7 @@ import java.util.Arrays;
  * Stateless math utility functions ported from C (math_utils.c).
  * All methods are static. Behavior matches the C implementation exactly.
  */
-public final class MathUtils {
+final class MathUtils {
 
     private MathUtils() {} // prevent instantiation
 
@@ -261,9 +261,7 @@ public final class MathUtils {
      */
     public static int deleteElement(double[] arr, int count, int index) {
         if (count == 0 || index >= count) return count;
-        for (int i = index; i < count - 1; i++) {
-            arr[i] = arr[i + 1];
-        }
+        System.arraycopy(arr, index + 1, arr, index, count - 1 - index);
         return count - 1;
     }
 
