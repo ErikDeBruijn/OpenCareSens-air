@@ -1,0 +1,36 @@
+plugins {
+    id 'java-library'
+}
+
+group = 'com.opencaresens'
+version = '0.1.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation 'org.junit.jupiter:junit-jupiter:5.10.2'
+}
+
+test {
+    useJUnitPlatform()
+    testLogging {
+        events "passed", "skipped", "failed"
+        showStandardStreams = true
+    }
+}
+
+jar {
+    manifest {
+        attributes(
+            'Implementation-Title': 'OpenCareSens-Air Calibration',
+            'Implementation-Version': version
+        )
+    }
+}
