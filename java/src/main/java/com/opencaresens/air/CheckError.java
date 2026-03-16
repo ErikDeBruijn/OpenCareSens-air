@@ -146,6 +146,25 @@ final class CheckError {
         double tran5min = debug.tranInA5min;
 
         if (seq > devInfo.err1Seq[0]) {
+            // Compute i_sse_d_mean BEFORE epoch reset check, so it is
+            // always output (oracle computes i_sse even on the reset step).
+            {
+                double prev = algoArgs.err1PrevLast1minCurr;
+                double sse = 0.0;
+                for (int k = 0; k < 5; k++) {
+                    double target = debug.tranInA1min[k];
+                    double delta = (target - prev) / 6.0;
+                    for (int j = 0; j < 6; j++) {
+                        double interp = prev + delta * (j + 1);
+                        double diff = debug.tranInA[k * 6 + j] - interp;
+                        sse += diff * diff;
+                    }
+                    prev = target;
+                }
+                double iSsePreReset = sse / 30.0;
+                debug.err1ISseDMean = iSsePreReset;
+            }
+
             // Epoch reset
             if (n >= devInfo.err1NLast && n > 0) {
                 double meanSse = algoArgs.err1ThSseDMean1 / (double) n;
@@ -194,22 +213,9 @@ final class CheckError {
                 algoArgs.err1Isfirst2 = 0;
             }
 
-            // Compute i_sse_d_mean
+            // Accumulate i_sse_d_mean (already computed before epoch reset check)
             {
-                double prev = algoArgs.err1PrevLast1minCurr;
-                double sse = 0.0;
-                for (int k = 0; k < 5; k++) {
-                    double target = debug.tranInA1min[k];
-                    double delta = (target - prev) / 6.0;
-                    for (int j = 0; j < 6; j++) {
-                        double interp = prev + delta * (j + 1);
-                        double diff = debug.tranInA[k * 6 + j] - interp;
-                        sse += diff * diff;
-                    }
-                    prev = target;
-                }
-                double iSse = sse / 30.0;
-                debug.err1ISseDMean = iSse;
+                double iSse = debug.err1ISseDMean;
 
                 if (algoArgs.err1Isfirst0 != 0) {
                     // Second epoch: accumulate into th_sse_d_mean2
@@ -241,6 +247,9 @@ final class CheckError {
                 if (algoArgs.err1Isfirst0 != 0) {
                     algoArgs.err1ThDiff2 = Double.NaN;
                 }
+                // Always write th_diff1/th_diff to debug (oracle outputs them at n==1)
+                debug.err1ThDiff1 = algoArgs.err1ThDiff1;
+                debug.err1ThDiff = algoArgs.err1ThDiff;
             } else {
                 double prevTran5min = algoArgs.err1ISseDMean4h[99];
                 double avgDiff = tran5min - prevTran5min;
@@ -404,7 +413,7 @@ final class CheckError {
                 int lagIdx = 287 - devInfo.err2Seq[1];
                 int crtC1 = (algoArgs.errGluArr[287] > gluThrCurr &&
                              lagIdx >= 0 &&
-                             algoArgs.errGluArr[lagIdx] > gluThrBase) ? 1 : 0;
+                             algoArgs.errGluArr[lagIdx] >= gluThrBase) ? 1 : 0;
 
                 int crtG0Threshold = (seq >= devInfo.err2StartSeq) ? 1 : 0;
 
@@ -455,27 +464,29 @@ final class CheckError {
             debug.err4Range = Double.NaN;
             debug.err4MinDiff = Double.NaN;
         } else {
-            // Update running min
+            // err4_range: consecutive difference
+            debug.err4Range = tran5min - algoArgs.err4InA[0];
+
+            // err4_min_diff: signed difference (tran5min - old_min) when new
+            // minimum is reached, 0.0 otherwise. Oracle-verified: the value is
+            // negative when tran_inA_5min breaks through its running minimum.
+            if (seq < devInfo.err345Seq2) {
+                debug.err4MinDiff = 0.0;
+            } else {
+                if (tran5min < algoArgs.err4MinPrev[0]) {
+                    // New minimum: report signed drop from previous minimum
+                    double minDiff = tran5min - algoArgs.err4MinPrev[0];
+                    debug.err4MinDiff = minDiff;
+                } else {
+                    debug.err4MinDiff = 0.0;
+                }
+            }
+
+            // Update running min (after computing min_diff)
             if (tran5min < algoArgs.err4MinPrev[0]) {
                 algoArgs.err4MinPrev[0] = tran5min;
             }
             debug.err4Min = algoArgs.err4MinPrev[0];
-
-            // err4_range: consecutive difference
-            debug.err4Range = tran5min - algoArgs.err4InA[0];
-
-            // err4_min_diff
-            double diff = Math.abs(tran5min - algoArgs.err4InA[0]);
-            if (seq < devInfo.err345Seq2) {
-                debug.err4MinDiff = 0.0;
-            } else if (seq == devInfo.err345Seq2) {
-                algoArgs.err4MinDiffPrev[0] = diff;
-                debug.err4MinDiff = diff;
-            } else {
-                if (diff < algoArgs.err4MinDiffPrev[0])
-                    algoArgs.err4MinDiffPrev[0] = diff;
-                debug.err4MinDiff = algoArgs.err4MinDiffPrev[0];
-            }
         }
 
         // Store current tran_5min for next step

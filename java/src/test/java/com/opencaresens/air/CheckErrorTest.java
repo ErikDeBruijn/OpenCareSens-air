@@ -689,27 +689,38 @@ class CheckErrorTest {
         }
 
         @Test
-        @DisplayName("err4_min_diff decreases correctly")
+        @DisplayName("err4_min_diff tracks signed drop on new minimum")
         void minDiffDecreases() {
             devInfo.err345Seq2 = 2;
 
+            // seq=1: init min=50
             debug.tranInA5min = 50.0;
             CheckError.detectErr4(devInfo, algoArgs, debug, 1);
 
-            // seq=2: initialize min_diff
+            // seq=2: tran5min=55 > min=50, no new minimum -> min_diff=0
             debug.tranInA5min = 55.0;
             CheckError.detectErr4(devInfo, algoArgs, debug, 2);
-            assertEquals(5.0, debug.err4MinDiff, EPS);
+            assertEquals(0.0, debug.err4MinDiff, EPS, "no new minimum");
 
-            // seq=3: diff = 2, smaller => updates
+            // seq=3: tran5min=53 > min=50, no new minimum -> min_diff=0
             debug.tranInA5min = 53.0;
             CheckError.detectErr4(devInfo, algoArgs, debug, 3);
-            assertEquals(2.0, debug.err4MinDiff, EPS);
+            assertEquals(0.0, debug.err4MinDiff, EPS, "no new minimum");
 
-            // seq=4: diff = 7, larger => stays at 2
-            debug.tranInA5min = 60.0;
+            // seq=4: tran5min=45 < min=50, new minimum -> min_diff = 45-50 = -5
+            debug.tranInA5min = 45.0;
             CheckError.detectErr4(devInfo, algoArgs, debug, 4);
-            assertEquals(2.0, debug.err4MinDiff, EPS);
+            assertEquals(-5.0, debug.err4MinDiff, EPS, "new min: signed drop");
+
+            // seq=5: tran5min=43 < min=45, new minimum -> min_diff = 43-45 = -2
+            debug.tranInA5min = 43.0;
+            CheckError.detectErr4(devInfo, algoArgs, debug, 5);
+            assertEquals(-2.0, debug.err4MinDiff, EPS, "new min: signed drop");
+
+            // seq=6: tran5min=50 > min=43, no new minimum -> min_diff=0
+            debug.tranInA5min = 50.0;
+            CheckError.detectErr4(devInfo, algoArgs, debug, 6);
+            assertEquals(0.0, debug.err4MinDiff, EPS, "no new minimum");
         }
 
         @Test
