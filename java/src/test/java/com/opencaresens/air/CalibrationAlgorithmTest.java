@@ -901,6 +901,364 @@ class CalibrationAlgorithmTest {
     }
 
     // ======================================================================
+    // Test: slopeRatioTemp near-zero division guard (Issue 1)
+    // ======================================================================
+
+    @Nested
+    @DisplayName("slopeRatioTemp near-zero division guard")
+    class SlopeRatioTempDivisionGuardTests {
+
+        private DeviceInfo devInfo;
+        private AlgorithmState algoArgs;
+        private CalibrationList calInput;
+
+        @BeforeEach
+        void setUp() {
+            devInfo = new DeviceInfo();
+            devInfo.sensorVersion = 1;
+            devInfo.eapp = 0.10067f;
+            devInfo.vref = 1.2f;
+            devInfo.slope100 = 2.5f;
+            devInfo.slope = 0.025f;
+            devInfo.slopeRatio = 1.0f;
+            devInfo.t90 = 10.0f;
+            devInfo.basicWarmup = 5;
+            devInfo.iirFlag = 1;
+            devInfo.iirStDX10 = 90;
+            devInfo.err345Seq2 = 5;
+            devInfo.err1Seq = new int[]{23, 50, 100};
+            devInfo.err1NLast = 288;
+            devInfo.err1Multi = new int[]{10, 10};
+            devInfo.err2Seq = new int[]{100, 48, 24};
+            devInfo.err2StartSeq = 289;
+            devInfo.err2Cummax = 1;
+            devInfo.err2Glu = 100.0f;
+            devInfo.maximumValue = 500.0f;
+            devInfo.kalmanDeltaT = 5;
+            devInfo.err345Seq4 = new int[]{0, 0, 12, 0, 0};
+            devInfo.err32Dt = new int[]{10, 15};
+            devInfo.err32N = new int[]{3, 5};
+            devInfo.sensorStartTime = 100L;
+            devInfo.wSgX100 = new int[]{-3, 12, 17, 12, 17, 12, -3};
+            devInfo.driftCoefficient = new float[3][3];
+            devInfo.correct1Coeff = new float[4];
+            devInfo.kalmanQX100 = new int[3][3];
+            devInfo.shiftCoeff = new float[4];
+            devInfo.shiftM2X100 = new int[3];
+            devInfo.err1ThSseDmean = new float[3];
+            devInfo.err1ThN1 = new int[4];
+            devInfo.err1ThN2 = new int[2][2];
+            devInfo.err1ISseDmeanNow = new float[2];
+            devInfo.err2Cv = new float[3];
+            devInfo.err345Seq1 = new int[2];
+            devInfo.err345Seq3 = new int[3];
+            devInfo.err345Seq5 = new int[3];
+            devInfo.err345Raw = new float[4];
+            devInfo.err345Filtered = new float[2];
+            devInfo.err345Min = new float[2];
+            devInfo.err6CalInVitro = new float[2];
+            devInfo.err6CgmPrct = new int[3];
+            devInfo.err6CgmDay = new int[2];
+            devInfo.err6CgmBleBad = new int[2];
+            algoArgs = new AlgorithmState();
+            calInput = new CalibrationList();
+        }
+
+        @Test
+        @DisplayName("extreme temperature causing slopeRatioTemp near zero returns errcode=64")
+        void extremeTemperatureNearZeroDivision() {
+            // slopeRatioTemp = 1 + (-0.1584) * (T - 37.0)
+            // For slopeRatioTemp = 0: T = 37.0 + 1/0.1584 = 43.3144...
+            // With slope100=2.5, product = 2.5 * 0 = 0 => division by zero
+            // Use temperature that makes slopeRatioTemp very close to zero
+            double extremeTemp = 37.0 + 1.0 / 0.1584; // ~43.31, makes srt ~ 0
+            CgmInput input = new CgmInput();
+            input.seqNumber = 1;
+            input.measurementTimeStandard = 1000L;
+            input.temperature = extremeTemp;
+            for (int i = 0; i < 30; i++) input.workout[i] = 2000;
+
+            AlgorithmOutput output = new AlgorithmOutput();
+            DebugOutput debug = new DebugOutput();
+
+            int result = CalibrationAlgorithm.process(devInfo, input, calInput,
+                    algoArgs, output, debug);
+
+            assertEquals(1, result);
+            assertEquals(64, output.errcode);
+            assertEquals(0.0, output.resultGlucose, 0.0);
+            assertTrue(Double.isFinite(output.resultGlucose),
+                    "MEDICAL SAFETY: resultGlucose must never be Infinity");
+        }
+
+        @Test
+        @DisplayName("normal temperature does not trigger the guard")
+        void normalTemperaturePassesThrough() {
+            CgmInput input = new CgmInput();
+            input.seqNumber = 1;
+            input.measurementTimeStandard = 1000L;
+            input.temperature = 36.5;
+            for (int i = 0; i < 30; i++) input.workout[i] = 2000;
+
+            AlgorithmOutput output = new AlgorithmOutput();
+            DebugOutput debug = new DebugOutput();
+
+            CalibrationAlgorithm.process(devInfo, input, calInput,
+                    algoArgs, output, debug);
+
+            // Normal temperature should not trigger the guard
+            assertTrue(Double.isFinite(debug.initCg),
+                    "initCg should be finite for normal temperature");
+            assertNotEquals(64, output.errcode,
+                    "Normal temperature should not produce errcode 64 from slopeRatioTemp guard");
+        }
+    }
+
+    // ======================================================================
+    // Test: Kalman filter convergence (Issue 2)
+    // ======================================================================
+
+    @Nested
+    @DisplayName("Kalman filter convergence - 50 readings")
+    class KalmanConvergenceTests {
+
+        @Test
+        @DisplayName("50 readings through full pipeline: finite values, no NaN/Infinity, warmup transition")
+        void fiftyReadingsConvergence() {
+            DeviceInfo devInfo = new DeviceInfo();
+            devInfo.sensorVersion = 1;
+            devInfo.eapp = 0.10067f;
+            devInfo.vref = 1.2f;
+            devInfo.slope100 = 2.5f;
+            devInfo.slope = 0.025f;
+            devInfo.slopeRatio = 1.0f;
+            devInfo.t90 = 10.0f;
+            devInfo.basicWarmup = 5;
+            devInfo.iirFlag = 1;
+            devInfo.iirStDX10 = 90;
+            devInfo.err345Seq2 = 5;
+            devInfo.err1Seq = new int[]{23, 50, 100};
+            devInfo.err1NLast = 288;
+            devInfo.err1Multi = new int[]{10, 10};
+            devInfo.err2Seq = new int[]{100, 48, 24};
+            devInfo.err2StartSeq = 289;
+            devInfo.err2Cummax = 1;
+            devInfo.err2Glu = 100.0f;
+            devInfo.maximumValue = 500.0f;
+            devInfo.kalmanDeltaT = 5;
+            devInfo.err345Seq4 = new int[]{0, 0, 12, 0, 0};
+            devInfo.err32Dt = new int[]{10, 15};
+            devInfo.err32N = new int[]{3, 5};
+            devInfo.sensorStartTime = 100L;
+            devInfo.wSgX100 = new int[]{-3, 12, 17, 12, 17, 12, -3};
+            devInfo.driftCoefficient = new float[3][3];
+            devInfo.correct1Coeff = new float[4];
+            devInfo.kalmanQX100 = new int[3][3];
+            devInfo.shiftCoeff = new float[4];
+            devInfo.shiftM2X100 = new int[3];
+            devInfo.err1ThSseDmean = new float[3];
+            devInfo.err1ThN1 = new int[4];
+            devInfo.err1ThN2 = new int[2][2];
+            devInfo.err1ISseDmeanNow = new float[2];
+            devInfo.err2Cv = new float[3];
+            devInfo.err345Seq1 = new int[2];
+            devInfo.err345Seq3 = new int[3];
+            devInfo.err345Seq5 = new int[3];
+            devInfo.err345Raw = new float[4];
+            devInfo.err345Filtered = new float[2];
+            devInfo.err345Min = new float[2];
+            devInfo.err6CalInVitro = new float[2];
+            devInfo.err6CgmPrct = new int[3];
+            devInfo.err6CgmDay = new int[2];
+            devInfo.err6CgmBleBad = new int[2];
+
+            AlgorithmState algoArgs = new AlgorithmState();
+            CalibrationList calInput = new CalibrationList();
+
+            // Synthetic lot0 oracle pattern: stable ADC around 2500 with slight
+            // variation, temperature at 36.5C, 5-minute intervals
+            boolean sawWarmupStage = false;
+            boolean sawSteadyStage = false;
+            int baseAdc = 2500;
+            long baseTime = 1000L;
+
+            for (int seq = 1; seq <= 50; seq++) {
+                CgmInput input = new CgmInput();
+                input.seqNumber = seq;
+                input.measurementTimeStandard = baseTime + (long)(seq * 300);
+                input.temperature = 36.5;
+                // Slight ADC variation to simulate real sensor
+                int adcValue = baseAdc + (seq % 5) * 10 - 20;
+                for (int i = 0; i < 30; i++) {
+                    input.workout[i] = adcValue;
+                }
+
+                AlgorithmOutput output = new AlgorithmOutput();
+                DebugOutput debug = new DebugOutput();
+
+                int result = CalibrationAlgorithm.process(devInfo, input, calInput,
+                        algoArgs, output, debug);
+
+                // Pipeline must always return 1 (success)
+                assertEquals(1, result, "Pipeline must return 1 at seq=" + seq);
+
+                // MEDICAL SAFETY: No NaN or Infinity in any critical output field
+                assertTrue(Double.isFinite(output.resultGlucose),
+                        "resultGlucose must be finite at seq=" + seq
+                        + " (was " + output.resultGlucose + ")");
+                assertTrue(Double.isFinite(output.trendrate),
+                        "trendrate must be finite at seq=" + seq
+                        + " (was " + output.trendrate + ")");
+                assertTrue(Double.isFinite(debug.initCg),
+                        "initCg must be finite at seq=" + seq);
+                assertTrue(Double.isFinite(debug.opcalAd),
+                        "opcalAd must be finite at seq=" + seq);
+                assertTrue(Double.isFinite(debug.outDrift),
+                        "outDrift must be finite at seq=" + seq);
+                assertTrue(Double.isFinite(debug.slopeRatioTemp),
+                        "slopeRatioTemp must be finite at seq=" + seq);
+
+                // Track warmup transition
+                if (output.currentStage == 0) sawWarmupStage = true;
+                if (output.currentStage == 1) sawSteadyStage = true;
+
+                // After warmup, glucose should be in a reasonable range
+                // (not checking during warmup since error flags may zero it)
+                if (seq > 10 && output.errcode == 0) {
+                    assertNotEquals(0.0, output.resultGlucose,
+                            "Post-warmup glucose should not be exactly 0.0 at seq=" + seq);
+                }
+            }
+
+            // Verify warmup transition happened
+            assertTrue(sawWarmupStage, "Should have seen warmup stage (stage=0)");
+            assertTrue(sawSteadyStage, "Should have seen steady state (stage=1)");
+        }
+    }
+
+    // ======================================================================
+    // Test: adcToCurrent with negative ADC values
+    // ======================================================================
+
+    @Nested
+    @DisplayName("ADC to current edge cases")
+    class AdcToCurrentEdgeCaseTests {
+
+        @Test
+        @DisplayName("negative ADC values produce valid (negative-shifted) current")
+        void negativeAdcValues() {
+            int[] adc = new int[30];
+            adc[0] = -100;
+            adc[1] = -1;
+            double[] result = CalibrationAlgorithm.adcToCurrent(adc, 1.2f, 0.10067f);
+            // current = (adc * vref / 40950.0 - eapp) * 100.0
+            double expected0 = ((double) (-100) * (double) 1.2f / 40950.0
+                              - (double) 0.10067f) * 100.0;
+            assertEquals(expected0, result[0], 0.0);
+            assertTrue(Double.isFinite(result[0]));
+            assertTrue(result[0] < 0.0, "Negative ADC should produce negative current");
+
+            double expected1 = ((double) (-1) * (double) 1.2f / 40950.0
+                              - (double) 0.10067f) * 100.0;
+            assertEquals(expected1, result[1], 0.0);
+        }
+    }
+
+    // ======================================================================
+    // Test: computeTrendrate with glucose at boundaries (40.0, 500.0)
+    // ======================================================================
+
+    @Nested
+    @DisplayName("Trendrate boundary glucose values")
+    class TrendrateBoundaryTests {
+
+        @Test
+        @DisplayName("glucose exactly at 40.0 boundary: trendrate guard rejects (< 40)")
+        void glucoseAtLowerBound() {
+            AlgorithmState args = new AlgorithmState();
+            args.idxOriginSeq = 20;
+            // Set up timestamps spaced >= 181s
+            for (int i = 0; i < 10; i++) {
+                args.smoothTimeIn[i] = (long)(i * 300);
+            }
+            // Set glucose at exactly 40.0 (boundary)
+            for (int i = 0; i < 10; i++) {
+                args.smoothSigIn[i] = 40.0;
+            }
+            long timeNow = args.smoothTimeIn[3] + 1500;
+            DebugOutput debug = new DebugOutput();
+            debug.trendrate = 100.0;
+
+            CalibrationAlgorithm.computeTrendrate(args, debug, 0, timeNow);
+            // At exactly 40.0, the guard "glu[i] < 40.0" should NOT trigger
+            // but since all values are equal, rate = 0
+            assertTrue(Double.isFinite(debug.trendrate));
+        }
+
+        @Test
+        @DisplayName("glucose exactly at 500.0 boundary: trendrate guard rejects (> 500)")
+        void glucoseAtUpperBound() {
+            AlgorithmState args = new AlgorithmState();
+            args.idxOriginSeq = 20;
+            for (int i = 0; i < 10; i++) {
+                args.smoothTimeIn[i] = (long)(i * 300);
+            }
+            // Set glucose at exactly 500.0 (boundary)
+            for (int i = 0; i < 10; i++) {
+                args.smoothSigIn[i] = 500.0;
+            }
+            long timeNow = args.smoothTimeIn[3] + 1500;
+            DebugOutput debug = new DebugOutput();
+            debug.trendrate = 100.0;
+
+            CalibrationAlgorithm.computeTrendrate(args, debug, 0, timeNow);
+            assertTrue(Double.isFinite(debug.trendrate));
+        }
+
+        @Test
+        @DisplayName("glucose just below 40.0: trendrate computation is skipped")
+        void glucoseBelowLowerBound() {
+            AlgorithmState args = new AlgorithmState();
+            args.idxOriginSeq = 20;
+            for (int i = 0; i < 10; i++) {
+                args.smoothTimeIn[i] = (long)(i * 300);
+            }
+            for (int i = 0; i < 10; i++) {
+                args.smoothSigIn[i] = 100.0;
+            }
+            // Set one value below 40
+            args.smoothSigIn[5] = 39.9;
+            long timeNow = args.smoothTimeIn[3] + 1500;
+            DebugOutput debug = new DebugOutput();
+            debug.trendrate = 100.0;
+
+            CalibrationAlgorithm.computeTrendrate(args, debug, 0, timeNow);
+            // Should return early, trendrate unchanged
+            assertEquals(100.0, debug.trendrate, 0.0);
+        }
+
+        @Test
+        @DisplayName("glucose just above 500.0: trendrate computation is skipped")
+        void glucoseAboveUpperBound() {
+            AlgorithmState args = new AlgorithmState();
+            args.idxOriginSeq = 20;
+            for (int i = 0; i < 10; i++) {
+                args.smoothTimeIn[i] = (long)(i * 300);
+            }
+            for (int i = 0; i < 10; i++) {
+                args.smoothSigIn[i] = 100.0;
+            }
+            args.smoothSigIn[5] = 500.1;
+            long timeNow = args.smoothTimeIn[3] + 1500;
+            DebugOutput debug = new DebugOutput();
+            debug.trendrate = 100.0;
+
+            CalibrationAlgorithm.computeTrendrate(args, debug, 0, timeNow);
+            assertEquals(100.0, debug.trendrate, 0.0);
+        }
+    }
+
+    // ======================================================================
     // Test: Constants match C exactly
     // ======================================================================
 

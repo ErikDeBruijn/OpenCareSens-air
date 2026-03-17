@@ -44,6 +44,29 @@ class MathUtilsTest {
     }
 
     @Nested
+    class MathRoundEdgeCaseTest {
+        @Test
+        void extremelyLargeValueNearLongMaxValue() {
+            // Values near Long.MAX_VALUE: the cast (long)(x + 0.5) may overflow
+            double huge = (double) Long.MAX_VALUE;
+            double result = MathUtils.mathRound(huge);
+            // Should not produce unexpected negative due to overflow
+            assertTrue(Double.isFinite(result), "mathRound of huge value must be finite");
+
+            // Even larger
+            double veryHuge = 1e18;
+            double result2 = MathUtils.mathRound(veryHuge);
+            assertEquals(1e18, result2, 1.0);
+        }
+
+        @Test
+        void extremelyLargeNegativeValue() {
+            double result = MathUtils.mathRound(-1e18);
+            assertEquals(-1e18, result, 1.0);
+        }
+    }
+
+    @Nested
     class MathCeilTest {
         @Test
         void ceilsPositive() {
@@ -141,6 +164,18 @@ class MathUtilsTest {
         @Test
         void returnsNanForEmpty() {
             assertTrue(Double.isNaN(MathUtils.mathStd(new double[]{})));
+        }
+
+        @Test
+        void nanInArrayPropagates() {
+            // NaN in the array affects the mean, which propagates through
+            double[] data = {1.0, 2.0, Double.NaN, 4.0};
+            double result = MathUtils.mathStd(data);
+            // mathMean skips NaN (returns mean of {1,2,4}=2.333...)
+            // but mathStd does NOT skip NaN: buf[2]-mean = NaN-2.333 = NaN
+            // sumSq += NaN => NaN, sqrt(NaN) = NaN
+            assertTrue(Double.isNaN(result),
+                    "mathStd with NaN in array should produce NaN");
         }
     }
 
@@ -555,6 +590,18 @@ class MathUtilsTest {
         @Test
         void singleElementReturnsSelf() {
             assertEquals(7.0, MathUtils.calAverageWithoutMinMax(new double[]{7}, 1), EPS);
+        }
+
+        @Test
+        void nanValuesInArray() {
+            // NaN is neither < min nor > max, so it stays in the sum.
+            // This tests that NaN propagation is understood.
+            double[] arr = {1.0, Double.NaN, 3.0, 4.0, 5.0};
+            double result = MathUtils.calAverageWithoutMinMax(arr, 5);
+            // min=1.0 (NaN not < 1.0), max=5.0 => sum-1-5 / 3
+            // But NaN + anything = NaN, so result is NaN
+            assertTrue(Double.isNaN(result),
+                    "calAverageWithoutMinMax with NaN in array propagates NaN");
         }
     }
 

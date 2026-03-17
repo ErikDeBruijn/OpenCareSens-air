@@ -373,7 +373,17 @@ final class CalibrationAlgorithm {
         }
 
         // --- Step 8: Initial calibrated glucose estimate ---
-        double initCg = outDrift * 100.0 / (dSlope100 * slopeRatioTemp);
+        // MEDICAL SAFETY: Guard against division by zero or near-zero when
+        // slopeRatioTemp is extreme (e.g., extreme temperature far from 37C).
+        // dSlope100 * slopeRatioTemp near zero would produce Infinity glucose.
+        double slopeTempProduct = dSlope100 * slopeRatioTemp;
+        if (Math.abs(slopeTempProduct) < 1e-10) {
+            algoDebug.nOpcalState = 1;
+            algoOutput.errcode = 64;
+            algoOutput.resultGlucose = 0.0;
+            return 1;
+        }
+        double initCg = outDrift * 100.0 / slopeTempProduct;
         algoDebug.initCg = initCg;
 
         // --- Step 9: Compute stage ---

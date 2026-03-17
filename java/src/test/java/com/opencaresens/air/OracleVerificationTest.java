@@ -887,6 +887,37 @@ class OracleVerificationTest {
     }
 
     // ======================================================================
+    // Oracle data existence check (Issue 3)
+    // ======================================================================
+
+    @Test
+    @DisplayName("Oracle data exists - warns visibly if missing (not silently skipped)")
+    void oracleDataExists() {
+        if (oracleBase == null) {
+            System.err.println("WARNING: Oracle data directory not found!");
+            System.err.println("WARNING: Oracle verification tests are being SKIPPED.");
+            System.err.println("WARNING: This means ZERO oracle coverage in this test run.");
+            System.err.println("WARNING: Expected oracle data at: " + ORACLE_ROOT);
+            System.err.println("WARNING: Or at: /Users/erik/github.com/erikdebruijn/OpenCareSens-air/oracle/output");
+            // Do NOT fail - this test is purely diagnostic. But make it loud.
+            return;
+        }
+        int lotsFound = 0;
+        for (int lot = 0; lot < 5; lot++) {
+            Path lotDir = Paths.get(oracleBase + "/lot" + lot);
+            if (Files.isDirectory(lotDir)) {
+                lotsFound++;
+            } else {
+                System.err.println("WARNING: Oracle data missing for lot" + lot
+                        + " at " + lotDir);
+            }
+        }
+        System.out.println("Oracle data check: " + lotsFound + "/5 lots available");
+        assertTrue(lotsFound > 0,
+                "At least one lot of oracle data should be present when oracleBase exists");
+    }
+
+    // ======================================================================
     // Aggregate summary test
     // ======================================================================
 
