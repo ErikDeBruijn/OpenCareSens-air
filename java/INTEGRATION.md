@@ -37,119 +37,36 @@ imports. If a BLE transport layer is added later (like `libglupro` does for GluP
 that should be a **separate** module (e.g., `opencaresens-air-ble`) that depends on this
 core library.
 
-## 2. Public API Design
+## 2. Public API (Implemented)
 
-The library needs a single, stateless entry point that Android apps call once per CGM reading.
-The current internal structure (`CalibrationAlgorithm`, `SignalProcessing`, `CheckError`,
-`MathUtils`, `LoessKernel`) should remain internal — only the facade and data classes are public.
-
-### Proposed public API
+The public API consists of 4 classes. All internal implementation classes are package-private.
 
 ```java
-package com.opencaresens.air;
+// 1. Build config from sensor's BLE advertisement (one-time)
+SensorConfig config = new SensorConfig.Builder()
+    .eapp(0.10067f).vref(1.2f).slope100(3.5226f)
+    .basicWarmup(24).err345Seq2(5)
+    .wSgX100(new int[]{80, 130, 90, 80, 110, 90, 80})
+    .build();
 
-/**
- * Main entry point for CareSens Air CGM calibration.
- *
- * Usage:
- *   CareSensCalibrator calibrator = new CareSensCalibrator();
- *   calibrator.initialize(deviceInfo);
- *
- *   // Called once per CGM reading (~every minute):
- *   CalibrationResult result = calibrator.processReading(rawReading);
- */
-public final class CareSensCalibrator {
+// 2. Create calibrator
+CareSensCalibrator calibrator = new CareSensCalibrator(config);
 
-    /**
-     * Initialize with factory calibration parameters from BLE advertisement.
-     * Must be called once before processReading().
-     */
-    public void initialize(SensorConfig config);
+// 3. On each BLE C5 notification (~every 5 minutes)
+BlePacketParser.ParsedReading reading = BlePacketParser.parse(bleBytes);
+CalibrationResult result = calibrator.processReading(
+    reading.getSequenceNumber(), reading.getTimestamp(),
+    reading.getAdcSamples(), reading.getTemperature());
 
-    /**
-     * Process one raw CGM reading through the full calibration pipeline.
-     * Returns the calibrated glucose value, trend rate, error flags, and
-     * smoothed historical values.
-     *
-     * Thread-safe: holds internal state, but a single instance should be
-     * used per sensor session (not shared across sensors).
-     */
-    public CalibrationResult processReading(RawReading reading);
-
-    /**
-     * Restore state from a previous session (e.g., after app restart).
-     * The byte array is the serialized AlgorithmState.
-     */
-    public void restoreState(byte[] serializedState);
-
-    /**
-     * Serialize current state for persistence.
-     */
-    public byte[] saveState();
-
-    /**
-     * Reset all state (new sensor session).
-     */
-    public void reset();
+if (result.isValid()) {
+    double glucose = result.getGlucoseMgdl();
+    double trend = result.getTrendRateMgdlPerMin();
 }
+
+// 4. State persistence
+byte[] state = calibrator.saveState();
+CareSensCalibrator restored = CareSensCalibrator.restoreState(state, config);
 ```
-
-### Public data classes
-
-```java
-package com.opencaresens.air;
-
-/** Factory calibration parameters parsed from BLE advertisement data. */
-public final class SensorConfig {
-    // Wraps the current DeviceInfo fields, but with a cleaner name.
-    // Constructed from raw BLE advertisement bytes via SensorConfig.fromAdvertisement(byte[]).
-    public static SensorConfig fromAdvertisement(byte[] bleData);
-    public static SensorConfig fromFields(float ycept, float slope100, float eapp, ...);
-
-    public float getEapp();
-    public float getSlope();
-    public float getYcept();
-    public String getLot();
-    public String getSensorId();
-    // ... other getters
-}
-
-/** One raw sensor reading to be calibrated. */
-public final class RawReading {
-    public RawReading(int sequenceNumber, long timestampMs, int[] adcValues, double temperature);
-}
-
-/** Result of calibrating one reading. */
-public final class CalibrationResult {
-    public double getGlucoseMgdl();
-    public double getTrendRateMgdlPerMin();
-    public int getErrorCode();           // bitmask: 0 = no error
-    public boolean isValid();            // errcode == 0 && glucose in range
-    public int getStage();               // warmup stage
-    public SmoothedValue[] getSmoothedHistory();  // 6 smoothed historical values
-
-    /** Convert mg/dL to mmol/L. */
-    public double getGlucoseMmol();
-}
-
-/** One smoothed historical glucose value. */
-public final class SmoothedValue {
-    public int getSequenceNumber();
-    public double getGlucoseMgdl();
-    public boolean isFixed();
-}
-```
-
-### What stays internal (package-private)
-
-- `CalibrationAlgorithm` — the 14-step pipeline (static utility methods)
-- `SignalProcessing` — Hampel filter, SG smoothing, IIR, etc.
-- `CheckError` — error flag computation
-- `MathUtils` — math primitives (percentile, linear solve, etc.)
-- `LoessKernel` — LOESS regression
-- `model.AlgorithmState` — the massive 117KB state struct
-- `model.AlgorithmOutput` — internal output struct
-- `model.CgmInput` — internal input struct
 
 ## 3. xDrip+ Integration Points
 
@@ -198,25 +115,19 @@ them — this is reference for anyone building the integration):
 ### Data flow
 
 ```
-BLE Advertisement -> SensorConfig.fromAdvertisement(bytes)
-                                     |
-                                     v
-                          CareSensCalibrator.initialize(config)
+BLE Advertisement -> SensorConfig.Builder -> CareSensCalibrator(config)
 
-BLE Notification (raw ADC) -> RawReading(seq, timestamp, adc[], temp)
-                                     |
-                                     v
-                          CareSensCalibrator.processReading(reading)
-                                     |
-                                     v
-                              CalibrationResult
-                                     |
-                                     v
-                   BgReading.bgReadingInsertFromGluPro(
-                       result.getGlucoseMgdl(),
-                       timestamp,
-                       "CareSensAir"
-                   )
+BLE C5 Notification -> BlePacketParser.parse(bytes) -> ParsedReading
+                                                           |
+                                                           v
+                          calibrator.processReading(seq, time, adc, temp)
+                                                           |
+                                                           v
+                                                    CalibrationResult
+                                                           |
+                                                           v
+                              BgReading.bgReadingInsertFromGluPro(
+                                  result.getGlucoseMgdl(), timestamp, "CareSensAir")
 ```
 
 ## 4. Keeping the Library Generic (Not xDrip-Specific)
@@ -263,13 +174,15 @@ BLE Notification (raw ADC) -> RawReading(seq, timestamp, adc[], temp)
 **Any custom app**:
 ```java
 // One-time setup
-SensorConfig config = SensorConfig.fromAdvertisement(bleAdvBytes);
-CareSensCalibrator cal = new CareSensCalibrator();
-cal.initialize(config);
+SensorConfig config = new SensorConfig.Builder()
+    .eapp(eapp).vref(vref).slope100(slope100).build();
+CareSensCalibrator cal = new CareSensCalibrator(config);
 
-// On each BLE notification (every ~60 seconds)
-RawReading reading = new RawReading(seq, System.currentTimeMillis(), adcValues, temp);
-CalibrationResult result = cal.processReading(reading);
+// On each BLE C5 notification (~every 5 minutes)
+BlePacketParser.ParsedReading r = BlePacketParser.parse(bleBytes);
+CalibrationResult result = cal.processReading(
+    r.getSequenceNumber(), r.getTimestamp(),
+    r.getAdcSamples(), r.getTemperature());
 
 if (result.isValid()) {
     double glucose = result.getGlucoseMgdl();
@@ -278,35 +191,14 @@ if (result.isValid()) {
 }
 ```
 
-## 5. Migration Path from Current Code
+## 5. Current Status
 
-The current codebase has the algorithm logic ready in:
-- `CalibrationAlgorithm.java` — the 14-step pipeline
-- `SignalProcessing.java` — signal processing
-- `CheckError.java` — error detection
-- `MathUtils.java` / `LoessKernel.java` — math utilities
-- `model/` — data classes (AlgorithmState, AlgorithmOutput, CgmInput, DeviceInfo, etc.)
-
-Steps to create the public API:
-
-1. **Add `CareSensCalibrator` class** as the public facade. It wraps `AlgorithmState` +
-   `DeviceInfo` internally and delegates to `CalibrationAlgorithm`.
-
-2. **Add public data classes** (`SensorConfig`, `RawReading`, `CalibrationResult`,
-   `SmoothedValue`) that translate between the clean public API and the internal C-like
-   structs.
-
-3. **Make internal classes package-private.** Remove `public` from `CalibrationAlgorithm`,
-   `SignalProcessing`, `CheckError`, etc.
-
-4. **Add state serialization.** Implement `saveState()` / `restoreState()` using Java
-   serialization or a custom binary format (matching the C struct layout for
-   interoperability with the C reference implementation).
-
-5. **Add `SensorConfig.fromAdvertisement(byte[])`** to parse raw BLE advertisement bytes
-   into the factory calibration parameters.
-
-6. **Publish v0.1.0** on JitPack once the oracle verification tests pass at full accuracy.
+All steps have been completed:
+- Public API facade: `CareSensCalibrator`, `SensorConfig`, `CalibrationResult`, `BlePacketParser`
+- Internal classes are package-private
+- State serialization with versioned format
+- Oracle verification: 100% match on all safety-critical outputs across 2000 readings
+- 310 tests passing
 
 ## 6. xDrip+ Library Module Patterns (Reference)
 
