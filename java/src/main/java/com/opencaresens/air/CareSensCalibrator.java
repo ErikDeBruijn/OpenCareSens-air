@@ -64,6 +64,9 @@ public final class CareSensCalibrator {
     private final CalibrationList calList;
     private int readingsProcessed;
 
+    /** Serialization format version. Increment when AlgorithmState layout changes. */
+    private static final int STATE_VERSION = 1;
+
     /**
      * Create a new calibrator for a CareSens Air sensor.
      *
@@ -164,6 +167,7 @@ public final class CareSensCalibrator {
         try {
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             ObjectOutputStream oos = new ObjectOutputStream(bos);
+            oos.writeInt(STATE_VERSION);
             oos.writeInt(readingsProcessed);
             oos.writeObject(state);
             oos.flush();
@@ -193,6 +197,13 @@ public final class CareSensCalibrator {
         try {
             ByteArrayInputStream bis = new ByteArrayInputStream(stateBytes);
             ObjectInputStream ois = new ObjectInputStream(bis);
+            int version = ois.readInt();
+            if (version != STATE_VERSION) {
+                throw new RuntimeException(
+                    "Incompatible state version: expected " + STATE_VERSION
+                    + ", got " + version
+                    + ". Saved state from a different library version cannot be restored.");
+            }
             int readingsProcessed = ois.readInt();
             AlgorithmState restoredState = (AlgorithmState) ois.readObject();
 
@@ -200,6 +211,8 @@ public final class CareSensCalibrator {
             calibrator.state = restoredState;
             calibrator.readingsProcessed = readingsProcessed;
             return calibrator;
+        } catch (RuntimeException e) {
+            throw e;
         } catch (Exception e) {
             throw new RuntimeException("Failed to deserialize calibrator state", e);
         }

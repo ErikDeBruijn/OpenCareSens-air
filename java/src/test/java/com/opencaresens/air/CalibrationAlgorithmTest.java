@@ -433,6 +433,78 @@ class CalibrationAlgorithmTest {
         }
 
         @Test
+        @DisplayName("equal timestamps prevent division by zero in rateLong")
+        void divByZeroRateLong() {
+            AlgorithmState args = new AlgorithmState();
+            args.idxOriginSeq = 20;
+            // Set up timestamps: T[3] == timeNow => denomLong == 0
+            long baseTime = 3000L;
+            for (int i = 0; i < 10; i++) {
+                args.smoothTimeIn[i] = baseTime + (long) (i * 300);
+            }
+            // Force T[3] == timeNow
+            long timeNow = args.smoothTimeIn[3];
+            // Set glucose values in valid range
+            for (int i = 0; i < 10; i++) {
+                args.smoothSigIn[i] = 100.0 + i * 5;
+            }
+            DebugOutput debug = new DebugOutput();
+            debug.trendrate = 100.0;
+
+            CalibrationAlgorithm.computeTrendrate(args, debug, 0, timeNow);
+            // trendrate must remain at sentinel, not become NaN/Infinity
+            assertEquals(100.0, debug.trendrate, 0.0);
+            assertFalse(Double.isNaN(debug.trendrate));
+            assertFalse(Double.isInfinite(debug.trendrate));
+        }
+
+        @Test
+        @DisplayName("equal timestamps prevent division by zero in rateShort")
+        void divByZeroRateShort() {
+            AlgorithmState args = new AlgorithmState();
+            args.idxOriginSeq = 20;
+            // Set up timestamps where T[3..9] are spaced >= 181s but T[8] == timeNow
+            for (int i = 0; i < 10; i++) {
+                args.smoothTimeIn[i] = (long) (i * 300);
+            }
+            long timeNow = args.smoothTimeIn[8]; // denomShort == 0
+            for (int i = 0; i < 10; i++) {
+                args.smoothSigIn[i] = 100.0 + i * 5;
+            }
+            DebugOutput debug = new DebugOutput();
+            debug.trendrate = 100.0;
+
+            CalibrationAlgorithm.computeTrendrate(args, debug, 0, timeNow);
+            assertFalse(Double.isNaN(debug.trendrate));
+            assertFalse(Double.isInfinite(debug.trendrate));
+        }
+
+        @Test
+        @DisplayName("equal timestamps prevent division by zero in rateMid")
+        void divByZeroRateMid() {
+            AlgorithmState args = new AlgorithmState();
+            args.idxOriginSeq = 20;
+            // Set up timestamps spaced >= 181s except T[7] == T[8]
+            for (int i = 0; i < 10; i++) {
+                args.smoothTimeIn[i] = (long) (i * 300);
+            }
+            args.smoothTimeIn[8] = args.smoothTimeIn[7]; // denomMid == 0
+            // Fix spacing: need T[3..9] consecutive pairs >= 181s
+            // With T[7]==T[8], T[7]->T[8] gap is 0, so the timestamp spacing guard
+            // will reject before we reach rateMid. Test that it's still safe.
+            for (int i = 0; i < 10; i++) {
+                args.smoothSigIn[i] = 100.0 + i * 5;
+            }
+            long timeNow = 3600L;
+            DebugOutput debug = new DebugOutput();
+            debug.trendrate = 100.0;
+
+            CalibrationAlgorithm.computeTrendrate(args, debug, 0, timeNow);
+            assertFalse(Double.isNaN(debug.trendrate));
+            assertFalse(Double.isInfinite(debug.trendrate));
+        }
+
+        @Test
         @DisplayName("error in delay array prevents trendrate computation")
         void errorDelayGuard() {
             AlgorithmState args = new AlgorithmState();
@@ -502,6 +574,21 @@ class CalibrationAlgorithmTest {
                     algoArgs, output, debug);
             assertEquals(1, result);
             assertEquals(1, debug.nOpcalState);
+        }
+
+        @Test
+        @DisplayName("slope100=0 rejected to prevent division by zero")
+        void zeroSlope100Rejected() {
+            devInfo.slope100 = 0.0f;
+            CgmInput input = createCgmInput(1, 1000L, 2000, 36.5);
+            AlgorithmOutput output = new AlgorithmOutput();
+            DebugOutput debug = new DebugOutput();
+
+            int result = CalibrationAlgorithm.process(devInfo, input, calInput,
+                    algoArgs, output, debug);
+            assertEquals(1, result);
+            assertEquals(1, debug.nOpcalState);
+            assertEquals(0.0, output.resultGlucose, 0.0);
         }
 
         @Test

@@ -117,7 +117,7 @@ public final class CalibrationResult {
      * as a sentinel value.
      */
     public boolean isTrendAvailable() {
-        return trendRate != 100.0;
+        return !Double.isNaN(trendRate) && !Double.isInfinite(trendRate) && trendRate != 100.0;
     }
 
     /**

@@ -83,7 +83,10 @@ final class SignalProcessing {
             sigOut[i] = sigBuf[i];
         }
 
-        // Skip convolution when buffer is still filling (zeros present)
+        // Oracle-verified: skip convolution when the post-shift buffer still has
+        // zeros in the active region [0..6]. This happens during the initial fill
+        // phase (seq 1-9). The convolution starts at seq 10 when all 10 values
+        // have been pushed and sigBuf[0] becomes non-zero after the shift.
         boolean windowValid = true;
         for (int i = 0; i <= 6; i++) {
             if (sigBuf[i] == 0.0) {

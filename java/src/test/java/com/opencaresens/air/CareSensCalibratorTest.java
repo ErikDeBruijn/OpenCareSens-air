@@ -95,12 +95,47 @@ class CareSensCalibratorTest {
         }
 
         @Test
+        @DisplayName("builder throws when only vref is zero")
+        void builderValidationVrefZero() {
+            assertThrows(IllegalStateException.class, () ->
+                new SensorConfig.Builder().slope100(2.5f).build());
+        }
+
+        @Test
+        @DisplayName("builder throws when only slope100 is zero")
+        void builderValidationSlope100Zero() {
+            assertThrows(IllegalStateException.class, () ->
+                new SensorConfig.Builder().vref(1.2f).build());
+        }
+
+        @Test
         @DisplayName("builder with only required fields succeeds")
         void builderMinimal() {
             SensorConfig config = new SensorConfig.Builder()
                 .vref(1.2f)
                 .slope100(2.5f)
                 .build();
+            assertEquals(1.2f, config.getVref());
+            assertEquals(2.5f, config.getSlope100());
+        }
+
+        @Test
+        @DisplayName("builder deep-copies DeviceInfo so post-build mutation is safe")
+        void builderImmutability() {
+            SensorConfig.Builder builder = new SensorConfig.Builder()
+                .eapp(0.10067f)
+                .vref(1.2f)
+                .slope100(2.5f)
+                .basicWarmup(5)
+                .err345Seq2(5);
+
+            SensorConfig config = builder.build();
+
+            // Mutate the builder after build
+            builder.vref(9.9f);
+            builder.slope100(9.9f);
+
+            // Config must retain original values
             assertEquals(1.2f, config.getVref());
             assertEquals(2.5f, config.getSlope100());
         }
@@ -177,6 +212,33 @@ class CareSensCalibratorTest {
                 120.0, 100.0, 0, 1, 0,
                 new double[6], new int[6], new int[6]);
             assertFalse(notAvailable.isTrendAvailable());
+        }
+
+        @Test
+        @DisplayName("NaN trend is not reported as available")
+        void trendNanNotAvailable() {
+            CalibrationResult r = new CalibrationResult(
+                120.0, Double.NaN, 0, 1, 0,
+                new double[6], new int[6], new int[6]);
+            assertFalse(r.isTrendAvailable());
+        }
+
+        @Test
+        @DisplayName("Infinity trend is not reported as available")
+        void trendInfinityNotAvailable() {
+            CalibrationResult r = new CalibrationResult(
+                120.0, Double.POSITIVE_INFINITY, 0, 1, 0,
+                new double[6], new int[6], new int[6]);
+            assertFalse(r.isTrendAvailable());
+        }
+
+        @Test
+        @DisplayName("Negative Infinity trend is not reported as available")
+        void trendNegInfinityNotAvailable() {
+            CalibrationResult r = new CalibrationResult(
+                120.0, Double.NEGATIVE_INFINITY, 0, 1, 0,
+                new double[6], new int[6], new int[6]);
+            assertFalse(r.isTrendAvailable());
         }
 
         @Test
@@ -399,6 +461,27 @@ class CareSensCalibratorTest {
         void restoreGarbage() {
             assertThrows(RuntimeException.class, () ->
                 CareSensCalibrator.restoreState(new byte[]{1, 2, 3}, createTypicalConfig()));
+        }
+
+        @Test
+        @DisplayName("restore detects incompatible version")
+        void restoreIncompatibleVersion() {
+            // Build a byte stream with wrong version number
+            try {
+                java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream();
+                java.io.ObjectOutputStream oos = new java.io.ObjectOutputStream(bos);
+                oos.writeInt(999); // wrong version
+                oos.writeInt(0);   // readingsProcessed
+                oos.writeObject(new com.opencaresens.air.model.AlgorithmState());
+                oos.flush();
+                byte[] badVersion = bos.toByteArray();
+
+                RuntimeException ex = assertThrows(RuntimeException.class, () ->
+                    CareSensCalibrator.restoreState(badVersion, createTypicalConfig()));
+                assertTrue(ex.getMessage().contains("Incompatible state version"));
+            } catch (Exception e) {
+                fail("Test setup failed: " + e.getMessage());
+            }
         }
     }
 

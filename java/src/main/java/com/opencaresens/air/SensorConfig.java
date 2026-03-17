@@ -216,11 +216,18 @@ public final class SensorConfig {
          * @throws IllegalStateException if required fields are missing
          */
         public SensorConfig build() {
-            if (di.vref == 0.0f && di.slope100 == 0.0f) {
+            if (di.vref == 0.0f) {
                 throw new IllegalStateException(
-                    "SensorConfig requires at least vref and slope100 to be set");
+                    "SensorConfig requires vref to be set");
             }
-            return new SensorConfig(di);
+            if (di.slope100 == 0.0f) {
+                throw new IllegalStateException(
+                    "SensorConfig requires slope100 to be set");
+            }
+            // Deep-copy to prevent mutation of builder from corrupting the SensorConfig
+            DeviceInfo copy = new DeviceInfo();
+            copyDeviceInfo(di, copy);
+            return new SensorConfig(copy);
         }
 
         private static void copyDeviceInfo(DeviceInfo src, DeviceInfo dst) {

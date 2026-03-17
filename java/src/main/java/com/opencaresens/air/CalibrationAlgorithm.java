@@ -282,7 +282,7 @@ final class CalibrationAlgorithm {
 
         if (dEapp < 0.0 || dEapp > 0.5 ||
             dVref < 0.0 || dVref > 3.0 ||
-            dSlope100 < 0.0 || dSlope100 > 10.0) {
+            dSlope100 <= 0.0 || dSlope100 > 10.0) {
             algoDebug.nOpcalState = 1;
             algoOutput.errcode = 0;
             algoOutput.resultGlucose = 0.0;
@@ -588,15 +588,22 @@ final class CalibrationAlgorithm {
             if (glu[i] <= 0.0 || glu[i] < 40.0 || glu[i] > 500.0) return;
         }
 
-        // Rate computation
-        double rateLong = (glu[6] - glu[0]) / ((double) (timeNow - algoArgs.smoothTimeIn[3]) / 60.0);
-        double rateShort = (glu[6] - glu[5]) / ((double) (timeNow - algoArgs.smoothTimeIn[8]) / 60.0);
+        // Rate computation (with zero-denominator guards to prevent NaN/Infinity)
+        double denomLong = (double) (timeNow - algoArgs.smoothTimeIn[3]) / 60.0;
+        if (denomLong == 0.0) return;
+        double rateLong = (glu[6] - glu[0]) / denomLong;
+
+        double denomShort = (double) (timeNow - algoArgs.smoothTimeIn[8]) / 60.0;
+        if (denomShort == 0.0) return;
+        double rateShort = (glu[6] - glu[5]) / denomShort;
 
         // Direction guard
         if (rateShort < 0.0 && rateLong >= 1.0) return;
         if (rateShort > 0.0 && rateLong <= -1.0) return;
 
-        double rateMid = (glu[5] - glu[4]) / ((double) (algoArgs.smoothTimeIn[8] - algoArgs.smoothTimeIn[7]) / 60.0);
+        double denomMid = (double) (algoArgs.smoothTimeIn[8] - algoArgs.smoothTimeIn[7]) / 60.0;
+        if (denomMid == 0.0) return;
+        double rateMid = (glu[5] - glu[4]) / denomMid;
         algoDebug.trendrate = (rateShort * rateMid >= 0.0) ? rateShort : 0.0;
     }
 
