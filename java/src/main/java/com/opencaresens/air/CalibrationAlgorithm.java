@@ -29,7 +29,8 @@ final class CalibrationAlgorithm {
     static final double TEMP_REF = 37.0;
     static final double TEMP_COEFF = 0.1584;
 
-    // Temperature correction (lot type 2)
+    // Temperature correction (lot type 2) — retained for reference; the oracle
+    // uses the lot_type 1 formula for all lot types (see computeSlopeRatioTempBuffered)
     static final double LOT2_TEMP_COEFF = 0.0328;
     static final double LOT2_TEMP_REF = 34.0854;
     static final int TEMP_BUF_SIZE = 4;

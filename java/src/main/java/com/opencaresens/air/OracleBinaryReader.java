@@ -1,11 +1,12 @@
 package com.opencaresens.air;
 
-import com.opencaresens.air.model.*;
+import com.opencaresens.air.model.AlgorithmOutput;
+import com.opencaresens.air.model.CgmInput;
+import com.opencaresens.air.model.DebugOutput;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
