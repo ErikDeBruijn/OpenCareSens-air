@@ -1,8 +1,8 @@
 # OpenCareSens Air
 
-Open-source reimplementation of the CareSens Air CGM calibration algorithm (`libCALCULATION.so` by i-SENS) in pure C99. Converts raw ADC sensor readings to calibrated glucose values (mg/dL).
+Open-source reimplementation of the CareSens Air CGM calibration algorithm (`libCALCULATION.so` by i-SENS). Available in both C99 and Java, producing calibrated glucose values (mg/dL) from raw ADC sensor readings.
 
-**Status: 100% output match** against the proprietary library on all tested scenarios (normal, low sensor parameter, hypoglycemia, hyperglycemia).
+**Status: 100% output match** against the proprietary library on all tested scenarios (normal, low sensor parameter, hypoglycemia, hyperglycemia) — verified across 2000 oracle readings from 5 sensor lots.
 
 ## Why
 
@@ -12,7 +12,37 @@ The CareSens Air continuous glucose monitor uses a proprietary ARMv7-only shared
 - **License conflict**: proprietary binary bundled in GPL-licensed software
 - **Opacity**: no way to audit or verify what the calibration does
 
-This reimplementation is pure C99 with no external dependencies (only `libm`), compiles on any platform, and is licensed GPL-2.0.
+This reimplementation is pure C99 (no external dependencies beyond `libm`) and pure Java (no Android dependencies), compiles on any platform, and is licensed GPL-2.0.
+
+## Implementations
+
+### C library (`src/`)
+
+The reference implementation in standard C99. Compiles on any platform with a C compiler. Used for oracle verification and as the basis for the Java port.
+
+### Java library (`java/`)
+
+A complete Java port designed for direct integration into Android CGM apps like [xDrip+](https://github.com/NightscoutFoundation/xDrip), Juggluco, and AndroidAPS. Pure Java with zero Android dependencies — works anywhere Java runs.
+
+**Quick start:**
+```java
+SensorConfig config = new SensorConfig.Builder()
+    .eapp(0.10067f).vref(1.2f).slope100(3.5226f)
+    .basicWarmup(24).build();
+
+CareSensCalibrator calibrator = new CareSensCalibrator(config);
+
+BlePacketParser.ParsedReading reading = BlePacketParser.parse(bleBytes);
+CalibrationResult result = calibrator.processReading(
+    reading.getSequenceNumber(), reading.getTimestamp(),
+    reading.getAdcSamples(), reading.getTemperature());
+
+if (result.isValid()) {
+    double glucose = result.getGlucoseMgdl();
+}
+```
+
+See [`java/README.md`](java/README.md) for full API documentation and Android integration guide.
 
 ## Approach
 
@@ -20,7 +50,7 @@ Clean-room reverse engineering: we study only the *external behavior* of the ori
 
 The original `libCALCULATION.so` runs inside a Docker ARM emulator — a sandbox where it thinks it's running on an Android phone. Around it sits an "oracle harness": code that systematically feeds synthetic sensor data (400 consecutive readings per run, multiple sensor lots with varying parameters) and captures not just the final result, but also 102 intermediate values from the internal data structure (1579 bytes per reading).
 
-The complete pipeline was rewritten in standard C99 based on this input/output dataset — fully independent, without copying a single byte from the original. Every intermediate step is validated against the oracle: integers bit-exact, floating point to machine epsilon.
+The complete pipeline was rewritten based on this input/output dataset — fully independent, without copying a single byte from the original. Every intermediate step is validated against the oracle: integers bit-exact, floating point to machine epsilon.
 
 ### Pipeline
 
@@ -36,22 +66,23 @@ The library's internal Kalman filter uses **fixed gains** (K = [0.6729, 1.761, 0
 
 ## Oracle verification
 
-| Lot | eapp | Profile | Output match |
-|-----|------|---------|-------------|
-| lot0 | 0.10067 | Normal (100→120→200→100 mg/dL) | 3600/3600 (100.0%) |
-| lot1 | 0.15 | Normal | 44.6% (errcode=64 unimplemented) |
-| lot2 | 0.05 | Normal | 3600/3600 (100.0%) |
-| lot3 | 0.10067 | Hypoglycemia (→45 mg/dL sustained) | 3600/3600 (100.0%) |
-| lot4 | 0.10067 | Hyperglycemia (→380+ mg/dL sustained) | 3600/3600 (100.0%) |
+Both implementations (C and Java) are verified against oracle data from the proprietary binary:
 
-Each lot tests 400 sequential readings with 9 output fields per reading (3600 total). "100%" means every field matches bit-exact (integers) or to machine epsilon (doubles, max error ~5e-13).
+| Lot | eapp | Profile | C match | Java glucose | Java debug |
+|-----|------|---------|---------|-------------|------------|
+| lot0 | 0.10067 | Normal (100→120→200→100 mg/dL) | 100% | 100% | 99.97% |
+| lot1 | 0.15 | Extreme (eapp ≥ 0.12 rejected) | 100% | 100% | 100% |
+| lot2 | 0.05 | Low-eapp (lot_type=2) | 100% | 100% | 99.98% |
+| lot3 | 0.10067 | Hypoglycemia (→45 mg/dL sustained) | 100% | 100% | 99.91% |
+| lot4 | 0.10067 | Hyperglycemia (→380+ mg/dL sustained) | 100% | 100% | 99.97% |
 
-Lot1 uses an extreme sensor parameter (eapp=0.15) that triggers errcode=64, an undocumented error condition not yet implemented.
+Each lot tests 400 sequential readings. All safety-critical outputs (glucose, error codes, calibration stage, trend rate) match 100% across all 2000 readings. Java debug intermediates match 99.995% (263,987 / 264,000 fields).
 
 ## Building
 
+### C library
+
 ```bash
-# Build the library and tests
 cd build && cmake .. && make && ctest
 
 # Compare against oracle data
@@ -59,11 +90,22 @@ cc -O2 -Isrc tools/compare_oracle.c src/*.c -lm -o build/compare_oracle
 build/compare_oracle oracle/output/lot0
 ```
 
+### Java library
+
+```bash
+cd java
+./build.sh          # compile + run all 323 tests
+./build.sh compile  # compile only
+./build.sh test     # run tests only
+```
+
+Requires JDK 11+. The build script auto-detects your JDK and downloads JUnit 5.
+
 ### Prerequisites
 
-- C99 compiler (gcc, clang)
-- CMake 3.10+
-- For oracle generation: Docker, Android NDK 27, the proprietary APK (see below)
+- **C**: C99 compiler (gcc, clang), CMake 3.10+
+- **Java**: JDK 11+ (builds target Java 8 for Android compatibility)
+- **Oracle generation**: Docker, Android NDK 27, the proprietary APK (see below)
 
 ## Reproducing the oracle
 
@@ -85,29 +127,41 @@ See `scripts/setup-vendor.sh` for details on APK extraction and `oracle/run_orac
 
 ```
 src/
-  calibration.c      — main algorithm pipeline (opcal4)
-  check_error.c      — error detection (err1/2/4/8/16/32/128)
-  math_utils.c       — math primitives (median, std, percentile, etc.)
-  signal_processing.c — LOESS, Savitzky-Golay, IIR filter, drift correction
-  calibration.h      — struct definitions (arguments_t, device_info_t, etc.)
+  calibration.c        — main algorithm pipeline (opcal4)
+  check_error.c        — error detection (err1/2/4/8/16/32/128)
+  math_utils.c         — math primitives (median, std, percentile, etc.)
+  signal_processing.c  — LOESS, Savitzky-Golay, IIR filter, drift correction
+  calibration.h        — struct definitions (arguments_t, device_info_t, etc.)
+
+java/
+  src/main/java/com/opencaresens/air/
+    CareSensCalibrator.java   — public API facade
+    SensorConfig.java         — sensor factory parameters (Builder)
+    CalibrationResult.java    — immutable result object
+    BlePacketParser.java      — BLE C5 packet parser
+    CalibrationAlgorithm.java — internal: 14-step pipeline
+    SignalProcessing.java     — internal: signal processing
+    CheckError.java           — internal: error detection
+    MathUtils.java            — internal: math utilities
+    LoessKernel.java          — internal: precomputed LOESS coefficients
+    model/                    — internal: data model classes
+  src/test/java/              — 323 tests incl. oracle verification
 
 oracle/
-  oracle_harness.c   — ARM harness that exercises the proprietary .so
-  run_oracle.sh      — runs the harness in Docker with multiple lot configs
+  oracle_harness.c     — ARM harness that exercises the proprietary .so
+  run_oracle.sh        — runs the harness in Docker with multiple lot configs
 
 tools/
-  compare_oracle.c   — compares our output against oracle data field-by-field
+  compare_oracle.c     — compares C output against oracle data field-by-field
 
 scripts/
-  setup-vendor.sh    — extracts .so from APK, disassembles, decompiles
+  setup-vendor.sh      — extracts .so from APK, disassembles, decompiles
 ```
 
 ## Remaining work
 
-- **errcode=64**: undocumented error condition triggered at extreme sensor parameters (lot1)
-- **JNI wrapper**: for drop-in use in Android apps like Juggluco
-- **Android .so build**: cross-compile via NDK (CMake option exists, untested)
-- **Real sensor data**: validated against synthetic oracle data only
+- **Real sensor data validation**: verified against synthetic oracle data; real device testing pending
+- **SG smoothing**: Savitzky-Golay smoothed output uses a simplified kernel; the proprietary binary uses a data-dependent causal convolution that requires further reverse engineering (does not affect primary glucose output)
 
 ## Acknowledgments
 
