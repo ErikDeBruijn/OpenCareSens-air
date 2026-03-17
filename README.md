@@ -163,6 +163,18 @@ scripts/
 - **Real sensor data validation**: verified against synthetic oracle data; real device testing pending
 - **SG smoothing**: Savitzky-Golay smoothed output uses a simplified kernel; the proprietary binary uses a data-dependent causal convolution that requires further reverse engineering (does not affect primary glucose output)
 
+## Downstream integrations
+
+The Java library is available as a Gradle dependency via [JitPack](https://jitpack.io):
+
+```groovy
+repositories { maven { url 'https://jitpack.io' } }
+dependencies { implementation 'com.github.erikdebruijn:OpenCareSens-air:v0.1.0' }
+```
+
+Known integrations (notify on major updates):
+- [xDrip+](https://github.com/NightscoutFoundation/xDrip) — @jamorham
+
 ## Acknowledgments
 
 This project builds on the pioneering work of the [Juggluco](https://github.com/j-kaltes/Juggluco) project by Jaap Korthals Altes, and the broader "We Will Not Wait" community that has made CGM data accessible to those who need it.

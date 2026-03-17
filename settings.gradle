@@ -1,0 +1,4 @@
+rootProject.name = 'opencaresens-air-root'
+
+include ':opencaresens-air'
+project(':opencaresens-air').projectDir = file('java')

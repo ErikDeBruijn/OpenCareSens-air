@@ -41,6 +41,9 @@ java/lib/
 __pycache__/
 *.pyc
 
+# Downstream integration correspondence
+.downstream/
+
 # OS
 .DS_Store
 Thumbs.db
