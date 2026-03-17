@@ -23,12 +23,13 @@ SensorConfig config = new SensorConfig.Builder()
 // 2. Create calibrator
 CareSensCalibrator calibrator = new CareSensCalibrator(config);
 
-// 3. Process each reading as it arrives (~every 5 minutes)
+// 3. Process each BLE notification as it arrives (~every 5 minutes)
+BlePacketParser.ParsedReading reading = BlePacketParser.parse(bleNotificationBytes);
 CalibrationResult result = calibrator.processReading(
-    sequenceNumber,       // starts at 1, increments each reading
-    timestampSeconds,     // Unix epoch seconds
-    adcSamples,           // int[30] raw ADC values from sensor
-    temperature           // skin temperature in Celsius
+    reading.getSequenceNumber(),
+    reading.getTimestamp(),
+    reading.getAdcSamples(),
+    reading.getTemperature()
 );
 
 if (result.isValid()) {
@@ -60,6 +61,16 @@ Not thread-safe. Use external synchronization or one instance per thread.
 Immutable container for factory calibration parameters parsed from BLE advertisement data. Built with `SensorConfig.Builder`.
 
 Required fields: `vref`, `slope100`. All others have defaults. See the Builder's javadoc for the full field list.
+
+### BlePacketParser
+
+Parses raw BLE C5 characteristic notifications (84 bytes) into components for `processReading()`.
+
+| Method | Description |
+|--------|-------------|
+| `BlePacketParser.parse(byte[])` | Static. Parse BLE notification bytes into a `ParsedReading` |
+
+`ParsedReading` provides: `getSequenceNumber()`, `getTimestamp()`, `getAdcSamples()`, `getTemperature()`, `getBattery()`, `getDeviceErrorCode()`.
 
 ### CalibrationResult
 
