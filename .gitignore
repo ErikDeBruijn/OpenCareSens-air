@@ -33,9 +33,16 @@ oracle/syslibs*/
 *.swp
 *~
 
+# Java build artifacts
+java/build/
+java/lib/
+
 # Python cache
 __pycache__/
 *.pyc
+
+# Downstream integration correspondence
+.downstream/
 
 # OS
 .DS_Store

@@ -1,0 +1,2 @@
+// Root build file for JitPack compatibility.
+// The actual library is in java/ — see java/build.gradle.

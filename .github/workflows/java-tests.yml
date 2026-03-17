@@ -1,0 +1,77 @@
+name: Java Tests
+
+on:
+  push:
+    branches: [main, feat/*]
+    paths: ['java/**', '.github/workflows/java-tests.yml']
+  pull_request:
+    branches: [main]
+    paths: ['java/**', '.github/workflows/java-tests.yml']
+
+jobs:
+  unit-tests:
+    name: Java unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Build and run unit tests
+        working-directory: java
+        run: ./build.sh
+
+  oracle-verification:
+    name: Oracle verification
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Download oracle data
+        run: |
+          # Download oracle data from release asset
+          gh release download oracle-data \
+            --pattern 'oracle-output.tar.gz' \
+            --dir /tmp \
+            || { echo "::warning::Oracle data release not found. Upload oracle-output.tar.gz to a release tagged 'oracle-data' to enable verification."; exit 0; }
+          tar xzf /tmp/oracle-output.tar.gz
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Compile Java sources
+        working-directory: java
+        run: ./build.sh compile
+
+      - name: Run oracle verification
+        working-directory: java
+        run: |
+          JUNIT_JAR="lib/junit-platform-console-standalone-1.10.2.jar"
+          java -jar "$JUNIT_JAR" \
+            --class-path "build/classes:build/test-classes" \
+            --scan-class-path "build/test-classes" \
+            --include-classname ".*OracleVerification.*" \
+            --details verbose
+
+  c-tests:
+    name: C tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build and test C library
+        run: |
+          mkdir -p build
+          cd build
+          cmake ..
+          make
+          ctest --output-on-failure
